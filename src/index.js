@@ -5,6 +5,7 @@ const { MCPClient } = require("./mcpClient");
 const { TTLCache } = require("./cache");
 const { getUser, upsertUser, deleteUser, allUsers } = require("./storage");
 const { getLocalDate, getLocalHour, getLocalDateTime } = require("./time");
+const { createTelegraphPage } = require("./telegraph");
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 if (!BOT_TOKEN) {
@@ -124,7 +125,7 @@ async function sendLongMessageToUser(userId, text, options = {}) {
   }
 }
 
-function formatToolResult(result) {
+function getToolRawText(result) {
   let rawText = "";
 
   if (typeof result === "string") {
@@ -160,7 +161,43 @@ function formatToolResult(result) {
     return "";
   }
 
-  return formatTelegramHtml(rawText);
+  return rawText.replace(/\\\\\s*$/gm, "");
+}
+
+function stripImagesFromText(text) {
+  if (!text) {
+    return "";
+  }
+  const lines = text.split("\n");
+  const cleaned = [];
+  for (const line of lines) {
+    if (/<img\\b/i.test(line)) {
+      continue;
+    }
+    const trimmed = line.trim();
+    if (!trimmed) {
+      cleaned.push(line);
+      continue;
+    }
+    if (/^(图片|优惠券图片|活动图片介绍|图片介绍)[:：]?$/i.test(trimmed)) {
+      continue;
+    }
+    if (/^(图片|优惠券图片|活动图片介绍|图片介绍)[:：]\\s*$/i.test(trimmed)) {
+      continue;
+    }
+    cleaned.push(line);
+  }
+  return cleaned.join("\n").replace(/\n{3,}/g, "\n\n");
+}
+
+function formatToolResult(result, options = {}) {
+  const rawText = getToolRawText(result);
+  if (!rawText) {
+    return "";
+  }
+  const removeImages = options.removeImages !== false;
+  const text = removeImages ? stripImagesFromText(rawText) : rawText;
+  return formatTelegramHtml(text);
 }
 
 function formatTelegramHtml(text) {
@@ -225,6 +262,88 @@ function escapeHtml(text) {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/\"/g, "&quot;");
+}
+
+function parseInlineNodes(text) {
+  if (!text) {
+    return [""];
+  }
+  const segments = text.split(/(\*\*[^*]+\*\*|`[^`]+`)/g).filter(Boolean);
+  return segments.map((segment) => {
+    if (segment.startsWith("**") && segment.endsWith("**")) {
+      const inner = segment.slice(2, -2);
+      return { tag: "strong", children: [inner] };
+    }
+    if (segment.startsWith("`") && segment.endsWith("`")) {
+      const inner = segment.slice(1, -1);
+      return { tag: "code", children: [inner] };
+    }
+    return segment;
+  });
+}
+
+function buildTelegraphNodes(text) {
+  const nodes = [];
+  const lines = text.split("\n");
+  let listItems = null;
+
+  const flushList = () => {
+    if (listItems && listItems.length) {
+      nodes.push({ tag: "ul", children: listItems });
+    }
+    listItems = null;
+  };
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      flushList();
+      continue;
+    }
+
+    const headingMatch = trimmed.match(/^(#{1,6})\s+(.+)$/);
+    if (headingMatch) {
+      flushList();
+      const level = headingMatch[1].length;
+      const tag = `h${Math.min(level, 4)}`;
+      nodes.push({ tag, children: parseInlineNodes(stripHtmlTags(headingMatch[2])) });
+      continue;
+    }
+
+    if (/^-{3,}$/.test(trimmed)) {
+      flushList();
+      nodes.push({ tag: "hr" });
+      continue;
+    }
+
+    const imgMatches = [...trimmed.matchAll(/<img[^>]*src=["']([^"']+)["'][^>]*>/gi)];
+    if (imgMatches.length) {
+      flushList();
+      const textWithoutImg = stripHtmlTags(trimmed.replace(/<img[^>]*>/gi, "")).trim();
+      if (textWithoutImg && !/^(图片|优惠券图片|活动图片介绍|图片介绍)[:：]?$/i.test(textWithoutImg)) {
+        nodes.push({ tag: "p", children: parseInlineNodes(textWithoutImg) });
+      }
+      for (const match of imgMatches) {
+        nodes.push({ tag: "img", attrs: { src: match[1] } });
+      }
+      continue;
+    }
+
+    const bulletMatch = trimmed.match(/^[-*+]\s+(.+)$/);
+    if (bulletMatch) {
+      if (!listItems) {
+        listItems = [];
+      }
+      listItems.push({ tag: "li", children: parseInlineNodes(stripHtmlTags(bulletMatch[1])) });
+      continue;
+    }
+
+    flushList();
+    nodes.push({ tag: "p", children: parseInlineNodes(stripHtmlTags(trimmed)) });
+  }
+
+  flushList();
+  return nodes;
 }
 
 function parseCommandArgs(ctx) {
@@ -558,6 +677,26 @@ function sendTokenGuide(ctx) {
   ctx.reply(TOKEN_GUIDE_MESSAGE, { disable_web_page_preview: true });
 }
 
+async function sendTelegraphArticle(ctx, title, rawText, fallbackPrefix) {
+  const nodes = buildTelegraphNodes(rawText);
+  if (!nodes.length) {
+    await sendLongMessage(ctx, "未返回数据。");
+    return;
+  }
+
+  try {
+    const url = await createTelegraphPage(title, nodes);
+    const message = `${fallbackPrefix}：<a href="${escapeHtml(url)}">点击查看</a>`;
+    await ctx.reply(message, {
+      disable_web_page_preview: false,
+      parse_mode: "HTML"
+    });
+  } catch (error) {
+    const warning = `${fallbackPrefix} Telegraph 生成失败，已改用文本展示：${error.message}`;
+    await sendLongMessage(ctx, warning + "\n\n" + formatTelegramHtml(stripImagesFromText(rawText)));
+  }
+}
+
 async function handleCalendar(ctx, specifiedDate) {
   const info = ensureAccount(ctx);
   if (!info) return;
@@ -573,8 +712,9 @@ async function handleCalendar(ctx, specifiedDate) {
 
   try {
     const result = await callToolWithToken(info.account.token, "campaign-calender", args);
-    const text = formatToolResult(result);
-    await sendLongMessage(ctx, text || "未返回数据。");
+    const rawText = getToolRawText(result);
+    const title = specifiedDate ? `麦当劳活动日历（${specifiedDate}）` : "麦当劳活动日历";
+    await sendTelegraphArticle(ctx, title, rawText, "活动日历已生成");
   } catch (error) {
     ctx.reply(`活动日历查询失败：${error.message}`);
   }
@@ -586,8 +726,8 @@ async function handleAvailableCoupons(ctx) {
 
   try {
     const result = await callToolWithToken(info.account.token, "available-coupons", {});
-    const text = formatToolResult(result);
-    await sendLongMessage(ctx, text || "未返回数据。");
+    const rawText = getToolRawText(result);
+    await sendTelegraphArticle(ctx, "麦麦省优惠券列表", rawText, "优惠券列表已生成");
   } catch (error) {
     ctx.reply(`优惠券列表查询失败：${error.message}`);
   }

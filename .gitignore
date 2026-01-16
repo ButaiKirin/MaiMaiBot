@@ -2,4 +2,5 @@
 .env
 node_modules/
 data/users.json
+data/telegraph.json
 data/*.tmp

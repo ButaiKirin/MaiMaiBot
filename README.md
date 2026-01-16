@@ -4,8 +4,8 @@ A Telegram bot that calls the McDonald's MCP tools (campaign calendar, coupons, 
 
 ## Features
 
-- Campaign calendar query (`campaign-calender`)
-- Available coupons list (`available-coupons`)
+- Campaign calendar query (`campaign-calender`) via Telegraph article (with images)
+- Available coupons list (`available-coupons`) via Telegraph article (with images)
 - One-click claim all coupons (`auto-bind-coupons`)
 - My coupons list (`my-coupons`)
 - Current time info (`now-time-info`)
@@ -61,6 +61,12 @@ See `.env.example` for all options. Key variables:
 - `AUTO_CLAIM_CHECK_MINUTES` (default: `10`)
 - `AUTO_CLAIM_HOUR` (default: `9`)
 - `AUTO_CLAIM_TIMEZONE` (default: `Asia/Shanghai`)
+
+## Notes
+
+- The bot uses MCP Streamable HTTP (protocol 2025-06-18).
+- The MCP token is required for all tool calls.
+- Telegraph access token is created automatically and stored at `data/telegraph.json`.
 
 ## Deployment
 
