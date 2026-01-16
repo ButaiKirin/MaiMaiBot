@@ -56,7 +56,7 @@ See `.env.example` for all options. Key variables:
 - `AUTO_CLAIM_HOUR` (default: `9`)
 - `AUTO_CLAIM_TIMEZONE` (default: `Asia/Shanghai`)
 
-## Ubuntu VPS Deployment
+## Deployment
 
 ### 1) Install Node.js
 
