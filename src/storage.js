@@ -119,6 +119,24 @@ function normalizeUser(user, userId) {
     }
   }
 
+  if (!user.stats || typeof user.stats !== "object") {
+    user.stats = {};
+    changed = true;
+  }
+
+  if (typeof user.stats.autoClaimRuns !== "number") {
+    user.stats.autoClaimRuns = 0;
+    changed = true;
+  }
+  if (typeof user.stats.manualClaimRuns !== "number") {
+    user.stats.manualClaimRuns = 0;
+    changed = true;
+  }
+  if (typeof user.stats.couponsClaimed !== "number") {
+    user.stats.couponsClaimed = 0;
+    changed = true;
+  }
+
   for (const [accountId, account] of Object.entries(user.accounts)) {
     if (!account || typeof account !== "object") {
       user.accounts[accountId] = { token: "" };

@@ -47,8 +47,9 @@ npm start
 - `/autoclaim on|off [name]` - enable/disable daily auto-claim per account
 - `/autoclaimreport success|fail on|off [name]` - enable/disable auto-claim reporting per account
 - `/status` - show account status
+- `/stats` - my claim stats
 - `/cleartoken` - clear all accounts
-- `/admin users` - admin stats (user count)
+- `/admin users` - admin stats (users/accounts/claim totals)
 
 ## Environment Variables
 

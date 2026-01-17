@@ -272,6 +272,33 @@ function simplifyClaimResultText(text) {
   return cleaned.join("\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
+function getClaimedCouponCount(rawText) {
+  if (!rawText) {
+    return 0;
+  }
+  const counts = parseClaimCounts(rawText);
+  if (counts && Number.isFinite(counts.success)) {
+    return counts.success;
+  }
+  const ids = parseCouponIds(rawText);
+  return ids.length;
+}
+
+function incrementUserStats(userId, delta) {
+  const user = getUser(userId) || {};
+  const current = user.stats || {};
+  const autoClaimRuns = Number(current.autoClaimRuns) || 0;
+  const manualClaimRuns = Number(current.manualClaimRuns) || 0;
+  const couponsClaimed = Number(current.couponsClaimed) || 0;
+  const updated = {
+    autoClaimRuns: autoClaimRuns + (delta.autoClaimRuns || 0),
+    manualClaimRuns: manualClaimRuns + (delta.manualClaimRuns || 0),
+    couponsClaimed: couponsClaimed + (delta.couponsClaimed || 0)
+  };
+  upsertUser(userId, { stats: updated });
+  return updated;
+}
+
 function parseClaimCounts(rawText) {
   if (!rawText) {
     return null;
@@ -755,6 +782,7 @@ bot.start((ctx) => {
     "/account list - 查看账号",
     "/account del 名称 - 删除账号",
     "/status - 查看账号状态",
+    "/stats - 我的领券统计",
     "/cleartoken - 清空全部账号"
   ].join("\n");
   ctx.reply(message, { disable_web_page_preview: true, ...MAIN_MENU });
@@ -896,6 +924,20 @@ function sendStatus(ctx) {
 
 bot.command("status", sendStatus);
 
+bot.command("stats", (ctx) => {
+  const userId = String(ctx.from.id);
+  const user = getUser(userId);
+  const stats = user && user.stats ? user.stats : { autoClaimRuns: 0, manualClaimRuns: 0, couponsClaimed: 0 };
+  ctx.reply(
+    [
+      "我的领券统计：",
+      `自动领券次数：${stats.autoClaimRuns || 0}`,
+      `手动领券次数：${stats.manualClaimRuns || 0}`,
+      `累计领取优惠券：${stats.couponsClaimed || 0}`
+    ].join("\n")
+  );
+});
+
 bot.command("admin", (ctx) => {
   if (!ensureAdmin(ctx)) {
     return;
@@ -908,18 +950,28 @@ bot.command("admin", (ctx) => {
     const userCount = Object.keys(users).length;
     let accountCount = 0;
     let autoClaimEnabledCount = 0;
+    let totalAutoClaimRuns = 0;
+    let totalManualClaimRuns = 0;
+    let totalCouponsClaimed = 0;
     for (const user of Object.values(users)) {
       const accounts = user.accounts || {};
       const entries = Object.values(accounts);
       accountCount += entries.length;
       autoClaimEnabledCount += entries.filter((account) => account && account.autoClaimEnabled).length;
+      const stats = user.stats || {};
+      totalAutoClaimRuns += Number(stats.autoClaimRuns) || 0;
+      totalManualClaimRuns += Number(stats.manualClaimRuns) || 0;
+      totalCouponsClaimed += Number(stats.couponsClaimed) || 0;
     }
     ctx.reply(
       [
         "管理员统计：",
         `用户数：${userCount}`,
         `账号数：${accountCount}`,
-        `已开启自动领券账号数：${autoClaimEnabledCount}`
+        `已开启自动领券账号数：${autoClaimEnabledCount}`,
+        `自动领券次数总计：${totalAutoClaimRuns}`,
+        `手动领券次数总计：${totalManualClaimRuns}`,
+        `累计领取优惠券总计：${totalCouponsClaimed}`
       ].join("\n")
     );
     return;
@@ -1016,7 +1068,9 @@ async function handleClaimCoupons(ctx) {
     const rawText = getToolRawText(result);
     const normalized = normalizeToolText(rawText);
     const simplified = simplifyClaimResultText(normalized);
+    const claimedCount = getClaimedCouponCount(normalized);
     recordClaimedCoupons(normalized, { userId: info.userId, accountId: info.accountId, reason: "manual" });
+    incrementUserStats(info.userId, { manualClaimRuns: 1, couponsClaimed: claimedCount });
     const text = formatTelegramHtml(stripImagesFromText(simplified));
     await sendLongMessage(ctx, text || "未返回数据。");
   } catch (error) {
@@ -1369,11 +1423,13 @@ async function runAutoClaimSweep() {
         const normalized = normalizeToolText(rawText);
         const simplified = simplifyClaimResultText(normalized);
         const claimed = hasClaimedCoupons(normalized);
+        const claimedCount = getClaimedCouponCount(normalized);
         recordClaimedCoupons(normalized, {
           userId: task.userId,
           accountId: task.accountId,
           reason: task.reason
         });
+        incrementUserStats(task.userId, { autoClaimRuns: 1, couponsClaimed: claimedCount });
 
         const message = [
           `自动领券结果（${today}）- 账号：${task.displayName}`,
@@ -1443,6 +1499,7 @@ bot.launch()
       { command: "autoclaim", description: "每日自动领券开关" },
       { command: "autoclaimreport", description: "自动领券汇报开关(成/败)" },
       { command: "status", description: "查看账号状态" },
+      { command: "stats", description: "查看我的领券统计" },
       { command: "cleartoken", description: "清空全部账号" },
       { command: "admin", description: "管理员统计" }
     ]).catch((error) => {
