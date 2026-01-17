@@ -32,6 +32,12 @@ const AUTO_CLAIM_MAX_PER_SWEEP = Number(process.env.AUTO_CLAIM_MAX_PER_SWEEP || 
 const AUTO_CLAIM_REQUEST_GAP_MS = Number(process.env.AUTO_CLAIM_REQUEST_GAP_MS || 1500);
 const GLOBAL_BURST_WINDOW_MINUTES = Number(process.env.GLOBAL_BURST_WINDOW_MINUTES || 30);
 const GLOBAL_BURST_CHECK_SECONDS = Number(process.env.GLOBAL_BURST_CHECK_SECONDS || 60);
+const ADMIN_TELEGRAM_IDS = new Set(
+  (process.env.ADMIN_TELEGRAM_IDS || "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean)
+);
 
 const cache = new TTLCache(CACHE_TTL_SECONDS * 1000);
 const telegraphCache = new TTLCache(CACHE_TTL_SECONDS * 1000);
@@ -511,6 +517,19 @@ function parseCommandArgs(ctx) {
   return text.split(/\s+/).slice(1).filter(Boolean);
 }
 
+function ensureAdmin(ctx) {
+  if (!ADMIN_TELEGRAM_IDS.size) {
+    ctx.reply("未配置管理员 ID，请先设置 ADMIN_TELEGRAM_IDS。");
+    return false;
+  }
+  const userId = ctx.from && ctx.from.id ? String(ctx.from.id) : "";
+  if (!ADMIN_TELEGRAM_IDS.has(userId)) {
+    ctx.reply("无权限使用该指令。");
+    return false;
+  }
+  return true;
+}
+
 function getAccountDisplayName(accountId, account) {
   if (account && account.label) {
     return account.label;
@@ -839,6 +858,38 @@ function sendStatus(ctx) {
 }
 
 bot.command("status", sendStatus);
+
+bot.command("admin", (ctx) => {
+  if (!ensureAdmin(ctx)) {
+    return;
+  }
+  const args = parseCommandArgs(ctx);
+  const sub = args[0] ? args[0].toLowerCase() : "users";
+
+  if (sub === "users" || sub === "stats" || sub === "count") {
+    const users = allUsers();
+    const userCount = Object.keys(users).length;
+    let accountCount = 0;
+    let autoClaimEnabledCount = 0;
+    for (const user of Object.values(users)) {
+      const accounts = user.accounts || {};
+      const entries = Object.values(accounts);
+      accountCount += entries.length;
+      autoClaimEnabledCount += entries.filter((account) => account && account.autoClaimEnabled).length;
+    }
+    ctx.reply(
+      [
+        "管理员统计：",
+        `用户数：${userCount}`,
+        `账号数：${accountCount}`,
+        `已开启自动领券账号数：${autoClaimEnabledCount}`
+      ].join("\n")
+    );
+    return;
+  }
+
+  ctx.reply("用法：/admin users");
+});
 
 function sendTokenGuide(ctx) {
   ctx.reply(TOKEN_GUIDE_MESSAGE, { disable_web_page_preview: true });
@@ -1353,7 +1404,8 @@ bot.launch()
       { command: "autoclaim", description: "每日自动领券开关" },
       { command: "autoclaimreport", description: "自动领券汇报开关(成/败)" },
       { command: "status", description: "查看账号状态" },
-      { command: "cleartoken", description: "清空全部账号" }
+      { command: "cleartoken", description: "清空全部账号" },
+      { command: "admin", description: "管理员统计" }
     ]).catch((error) => {
       console.error("Failed to set bot commands", error);
     });

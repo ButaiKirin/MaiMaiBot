@@ -48,6 +48,7 @@ npm start
 - `/autoclaimreport success|fail on|off [name]` - enable/disable auto-claim reporting per account
 - `/status` - show account status
 - `/cleartoken` - clear all accounts
+- `/admin users` - admin stats (user count)
 
 ## Environment Variables
 
@@ -64,6 +65,7 @@ See `.env.example` for all options. Key variables:
 - `AUTO_CLAIM_REQUEST_GAP_MS` (default: `1500`)
 - `GLOBAL_BURST_WINDOW_MINUTES` (default: `30`)
 - `GLOBAL_BURST_CHECK_SECONDS` (default: `60`)
+- `ADMIN_TELEGRAM_IDS` (comma-separated Telegram user IDs)
 
 ## Notes
 
