@@ -1,6 +1,6 @@
 # MaiMai Telegram Bot
 
-A Telegram bot that calls the McDonald's MCP tools (campaign calendar, coupons, and time info) via Streamable HTTP.
+A Telegram bot that calls the McDonald's MCP tools (campaign calendar and coupons) via Streamable HTTP.
 
 ## Features
 
@@ -8,9 +8,8 @@ A Telegram bot that calls the McDonald's MCP tools (campaign calendar, coupons, 
 - Available coupons list (`available-coupons`) via Telegraph article (with images)
 - One-click claim all coupons (`auto-bind-coupons`)
 - My coupons list (`my-coupons`)
-- Current time info (`now-time-info`)
 - Optional 5-minute cache for non-user-specific tools
-- Daily auto-claim (once per day)
+- Daily auto-claim (once per day) with burst scheduling when new coupons appear
 - Multiple MCP accounts per Telegram user (switchable)
 
 ## Requirements
@@ -45,7 +44,6 @@ npm start
 - `/coupons` - available coupons
 - `/claim` - one-click claim all available coupons
 - `/mycoupons` - my coupons list
-- `/time` - current time info
 - `/autoclaim on|off [name]` - enable/disable daily auto-claim per account
 - `/autoclaimreport success|fail on|off [name]` - enable/disable auto-claim reporting per account
 - `/status` - show account status
@@ -57,11 +55,15 @@ See `.env.example` for all options. Key variables:
 
 - `MCD_MCP_URL` (default: `https://mcp.mcd.cn/mcp-servers/mcd-mcp`)
 - `CACHE_TTL_SECONDS` (default: `300`)
-- `CACHEABLE_TOOLS` (default: `campaign-calender,now-time-info`)
+- `CACHEABLE_TOOLS` (default: `campaign-calender,available-coupons`)
 - `AUTO_CLAIM_CHECK_MINUTES` (default: `10`)
 - `AUTO_CLAIM_HOUR` (default: `9`)
 - `AUTO_CLAIM_TIMEZONE` (default: `Asia/Shanghai`)
 - `AUTO_CLAIM_SPREAD_MINUTES` (default: `600`)
+- `AUTO_CLAIM_MAX_PER_SWEEP` (default: `10`)
+- `AUTO_CLAIM_REQUEST_GAP_MS` (default: `1500`)
+- `GLOBAL_BURST_WINDOW_MINUTES` (default: `30`)
+- `GLOBAL_BURST_CHECK_SECONDS` (default: `60`)
 
 ## Notes
 
@@ -69,6 +71,7 @@ See `.env.example` for all options. Key variables:
 - The MCP token is required for all tool calls.
 - Telegraph access token is created automatically and stored at `data/telegraph.json`.
 - Auto-claim runs once per account per day, scheduled across a spread window to avoid bursts.
+- When any account claims a previously unseen coupon, the bot triggers a short burst window so all accounts attempt to claim within that time.
 
 ## Deployment
 

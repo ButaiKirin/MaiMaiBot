@@ -13,20 +13,23 @@ function ensureDataDir() {
 function loadStore() {
   ensureDataDir();
   if (!fs.existsSync(usersFile)) {
-    return { users: {} };
+    return { users: {}, global: {} };
   }
   try {
     const raw = fs.readFileSync(usersFile, "utf8");
     const parsed = JSON.parse(raw);
     if (!parsed || typeof parsed !== "object") {
-      return { users: {} };
+      return { users: {}, global: {} };
     }
     if (!parsed.users || typeof parsed.users !== "object") {
       parsed.users = {};
     }
+    if (!parsed.global || typeof parsed.global !== "object") {
+      parsed.global = {};
+    }
     return parsed;
   } catch (error) {
-    return { users: {} };
+    return { users: {}, global: {} };
   }
 }
 
@@ -38,6 +41,38 @@ function saveStore(store) {
 }
 
 const store = loadStore();
+
+function normalizeGlobal(globalState) {
+  let changed = false;
+  let normalized = globalState;
+
+  if (!normalized || typeof normalized !== "object") {
+    normalized = {};
+    changed = true;
+  }
+
+  if (!normalized.knownCoupons || typeof normalized.knownCoupons !== "object") {
+    normalized.knownCoupons = {};
+    changed = true;
+  }
+
+  if (normalized.burst && typeof normalized.burst !== "object") {
+    normalized.burst = null;
+    changed = true;
+  }
+
+  if (typeof normalized.lastAutoClaimRequestAt !== "number") {
+    normalized.lastAutoClaimRequestAt = 0;
+    changed = true;
+  }
+
+  if (changed) {
+    store.global = normalized;
+    saveStore(store);
+  }
+
+  return normalized;
+}
 
 function normalizeUser(user, userId) {
   let changed = false;
@@ -136,6 +171,23 @@ function getUser(userId) {
   return normalizeUser(user, userId);
 }
 
+function getGlobalState() {
+  if (!store.global || typeof store.global !== "object") {
+    store.global = {};
+  }
+  return normalizeGlobal(store.global);
+}
+
+function updateGlobalState(updates) {
+  const current = getGlobalState();
+  store.global = {
+    ...current,
+    ...updates
+  };
+  saveStore(store);
+  return store.global;
+}
+
 function upsertUser(userId, updates) {
   const existing = store.users[userId] || {};
   store.users[userId] = {
@@ -164,6 +216,8 @@ function allUsers() {
 
 module.exports = {
   getUser,
+  getGlobalState,
+  updateGlobalState,
   upsertUser,
   deleteUser,
   allUsers

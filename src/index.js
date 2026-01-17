@@ -3,7 +3,7 @@ require("dotenv").config();
 const { Telegraf, Markup } = require("telegraf");
 const { MCPClient } = require("./mcpClient");
 const { TTLCache } = require("./cache");
-const { getUser, upsertUser, deleteUser, allUsers } = require("./storage");
+const { getUser, getGlobalState, updateGlobalState, upsertUser, deleteUser, allUsers } = require("./storage");
 const { getLocalDate, getMinutesSinceMidnight, getLocalDateTime } = require("./time");
 const { createTelegraphPage } = require("./telegraph");
 
@@ -18,7 +18,7 @@ const MCP_PROTOCOL_VERSION = process.env.MCP_PROTOCOL_VERSION || "2025-06-18";
 
 const CACHE_TTL_SECONDS = Number(process.env.CACHE_TTL_SECONDS || 300);
 const CACHEABLE_TOOLS = new Set(
-  (process.env.CACHEABLE_TOOLS || "campaign-calender,now-time-info")
+  (process.env.CACHEABLE_TOOLS || "campaign-calender,available-coupons")
     .split(",")
     .map((value) => value.trim())
     .filter(Boolean)
@@ -28,10 +28,16 @@ const AUTO_CLAIM_CHECK_MINUTES = Number(process.env.AUTO_CLAIM_CHECK_MINUTES || 
 const AUTO_CLAIM_HOUR = Number(process.env.AUTO_CLAIM_HOUR || 9);
 const AUTO_CLAIM_TIMEZONE = process.env.AUTO_CLAIM_TIMEZONE || "Asia/Shanghai";
 const AUTO_CLAIM_SPREAD_MINUTES = Number(process.env.AUTO_CLAIM_SPREAD_MINUTES || 600);
+const AUTO_CLAIM_MAX_PER_SWEEP = Number(process.env.AUTO_CLAIM_MAX_PER_SWEEP || 10);
+const AUTO_CLAIM_REQUEST_GAP_MS = Number(process.env.AUTO_CLAIM_REQUEST_GAP_MS || 1500);
+const GLOBAL_BURST_WINDOW_MINUTES = Number(process.env.GLOBAL_BURST_WINDOW_MINUTES || 30);
+const GLOBAL_BURST_CHECK_SECONDS = Number(process.env.GLOBAL_BURST_CHECK_SECONDS || 60);
 
 const cache = new TTLCache(CACHE_TTL_SECONDS * 1000);
+const telegraphCache = new TTLCache(CACHE_TTL_SECONDS * 1000);
 const bot = new Telegraf(BOT_TOKEN);
 let autoClaimInterval = null;
+let burstInterval = null;
 
 const TOKEN_GUIDE_MESSAGE = [
   "先获取麦当劳 MCP Token：",
@@ -53,13 +59,13 @@ const ACCOUNT_HELP_MESSAGE = [
 ].join("\n");
 
 const MAIN_MENU = Markup.inlineKeyboard([
-  [Markup.button.callback("活动日历（本月）", "menu_calendar"), Markup.button.callback("当前时间", "menu_time")],
-  [Markup.button.callback("可领优惠券", "menu_available"), Markup.button.callback("一键领券", "menu_claim")],
-  [Markup.button.callback("我的优惠券", "menu_mycoupons"), Markup.button.callback("账号状态", "menu_status")],
+  [Markup.button.callback("活动日历（本月）", "menu_calendar"), Markup.button.callback("可领优惠券", "menu_available")],
+  [Markup.button.callback("一键领券", "menu_claim"), Markup.button.callback("我的优惠券", "menu_mycoupons")],
+  [Markup.button.callback("账号状态", "menu_status"), Markup.button.callback("账号管理", "menu_accounts")],
   [Markup.button.callback("开启自动领券", "menu_autoclaim_on"), Markup.button.callback("关闭自动领券", "menu_autoclaim_off")],
   [Markup.button.callback("开启成功汇报", "menu_report_success_on"), Markup.button.callback("关闭成功汇报", "menu_report_success_off")],
   [Markup.button.callback("开启失败汇报", "menu_report_fail_on"), Markup.button.callback("关闭失败汇报", "menu_report_fail_off")],
-  [Markup.button.callback("账号管理", "menu_accounts"), Markup.button.callback("Token 获取指引", "menu_token_help")]
+  [Markup.button.callback("Token 获取指引", "menu_token_help")]
 ]);
 
 function chunkText(text, maxLength = 3500) {
@@ -166,7 +172,61 @@ function getToolRawText(result) {
     return "";
   }
 
-  return rawText.replace(/\\\\\s*$/gm, "");
+  return rawText;
+}
+
+function normalizeToolText(rawText, options = {}) {
+  if (!rawText) {
+    return "";
+  }
+
+  let text = rawText.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  text = text.replace(/<br\s*\/?>/gi, "\n");
+  text = text.replace(/^\s*如果当前的 Client 支持 Markdown 渲染.*$/gm, "");
+  text = text.replace(/^\s*请你把下面响应的内容以 Markdown 格式返回给用户[:：]?\s*$/gm, "");
+  text = text.replace(/```(?:\w+)?\n([\s\S]*?)```/g, "$1");
+  text = text.replace(/```/g, "");
+  text = text.replace(/\\\s*$/gm, "");
+  if (text.includes("\\n")) {
+    text = text.replace(/\\n/g, "\n");
+  }
+  text = text.replace(/\n{3,}/g, "\n\n");
+
+  if (options.removeTimeInfo) {
+    text = text
+      .split("\n")
+      .filter((line) => {
+        const trimmed = line.trim();
+        if (!trimmed) {
+          return true;
+        }
+        return !/^#{1,6}\s*当前时间[:：]/.test(trimmed) && !/^当前时间[:：]/.test(trimmed);
+      })
+      .join("\n");
+  }
+
+  if (options.removeClaimStatus) {
+    text = text
+      .split("\n")
+      .filter((line) => {
+        const trimmed = line.trim();
+        if (!trimmed) {
+          return true;
+        }
+        return !/(领取状态|是否已领取|已领取|未领取)/.test(trimmed);
+      })
+      .join("\n");
+  }
+
+  return text.trim();
+}
+
+function normalizeCalendarText(rawText) {
+  return normalizeToolText(rawText, { removeTimeInfo: true });
+}
+
+function normalizeCouponListText(rawText) {
+  return normalizeToolText(rawText, { removeClaimStatus: true });
 }
 
 function parseClaimCounts(rawText) {
@@ -204,6 +264,66 @@ function hasClaimedCoupons(rawText) {
   return false;
 }
 
+function parseCouponIds(rawText) {
+  if (!rawText) {
+    return [];
+  }
+  const ids = new Set();
+  const regex = /couponId[:：]\s*([0-9a-zA-Z]+)/g;
+  let match;
+  while ((match = regex.exec(rawText))) {
+    ids.add(match[1].toUpperCase());
+  }
+  return Array.from(ids);
+}
+
+function recordClaimedCoupons(rawText, trigger) {
+  const couponIds = parseCouponIds(rawText);
+  if (!couponIds.length) {
+    return { newCouponIds: [], couponIds: [] };
+  }
+
+  const state = getGlobalState();
+  const knownCoupons = state.knownCoupons || {};
+  const updated = { ...knownCoupons };
+  const nowIso = new Date().toISOString();
+  const newCouponIds = [];
+
+  for (const id of couponIds) {
+    if (!updated[id]) {
+      updated[id] = nowIso;
+      newCouponIds.push(id);
+    }
+  }
+
+  if (newCouponIds.length) {
+    const nowMs = Date.now();
+    const windowMinutes = Number.isFinite(GLOBAL_BURST_WINDOW_MINUTES) ? GLOBAL_BURST_WINDOW_MINUTES : 0;
+    const burst =
+      windowMinutes > 0
+        ? {
+            id: `burst_${nowMs}`,
+            startAt: nowMs,
+            endAt: nowMs + windowMinutes * 60 * 1000,
+            windowMinutes,
+            couponIds: newCouponIds,
+            triggeredAt: nowIso,
+            triggeredBy: trigger || null
+          }
+        : null;
+
+    updateGlobalState({
+      knownCoupons: updated,
+      burst
+    });
+    if (burst) {
+      ensureBurstScheduler(true);
+    }
+  }
+
+  return { newCouponIds, couponIds };
+}
+
 function stripImagesFromText(text) {
   if (!text) {
     return "";
@@ -231,7 +351,7 @@ function stripImagesFromText(text) {
 }
 
 function formatToolResult(result, options = {}) {
-  const rawText = getToolRawText(result);
+  const rawText = normalizeToolText(getToolRawText(result), options.normalizeOptions);
   if (!rawText) {
     return "";
   }
@@ -520,12 +640,16 @@ function removeAccount(userId, accountId) {
   return true;
 }
 
+function getToolCacheKey(toolName, args) {
+  return `${toolName}:${JSON.stringify(args || {})}`;
+}
+
 async function callToolWithToken(token, toolName, args) {
   if (!token) {
     throw new Error("缺少 MCP Token，请先设置。");
   }
 
-  const cacheKey = `${toolName}:${JSON.stringify(args || {})}`;
+  const cacheKey = getToolCacheKey(toolName, args);
   const useCache = CACHEABLE_TOOLS.has(toolName);
   if (useCache) {
     const cached = cache.get(cacheKey);
@@ -568,7 +692,6 @@ bot.start((ctx) => {
     "/coupons - 麦麦省可领取券列表",
     "/claim - 麦麦省一键领券",
     "/mycoupons - 我的优惠券",
-    "/time - 当前时间信息",
     "/autoclaim on|off [账号名] - 每日自动领券",
     "/autoclaimreport success|fail on|off [账号名] - 自动领券结果汇报",
     "/account add 名称 Token - 添加账号",
@@ -721,7 +844,7 @@ function sendTokenGuide(ctx) {
   ctx.reply(TOKEN_GUIDE_MESSAGE, { disable_web_page_preview: true });
 }
 
-async function sendTelegraphArticle(ctx, title, rawText, fallbackPrefix) {
+async function sendTelegraphArticle(ctx, title, rawText, fallbackPrefix, cacheKey) {
   const nodes = buildTelegraphNodes(rawText);
   if (!nodes.length) {
     await sendLongMessage(ctx, "未返回数据。");
@@ -729,7 +852,22 @@ async function sendTelegraphArticle(ctx, title, rawText, fallbackPrefix) {
   }
 
   try {
+    if (cacheKey) {
+      const cached = telegraphCache.get(cacheKey);
+      if (cached) {
+        const message = `${fallbackPrefix}：<a href="${escapeHtml(cached)}">点击查看</a>`;
+        await ctx.reply(message, {
+          disable_web_page_preview: false,
+          parse_mode: "HTML"
+        });
+        return;
+      }
+    }
+
     const url = await createTelegraphPage(title, nodes);
+    if (cacheKey) {
+      telegraphCache.set(cacheKey, url);
+    }
     const message = `${fallbackPrefix}：<a href="${escapeHtml(url)}">点击查看</a>`;
     await ctx.reply(message, {
       disable_web_page_preview: false,
@@ -757,8 +895,10 @@ async function handleCalendar(ctx, specifiedDate) {
   try {
     const result = await callToolWithToken(info.account.token, "campaign-calender", args);
     const rawText = getToolRawText(result);
+    const cleaned = normalizeCalendarText(rawText);
     const title = specifiedDate ? `麦当劳活动日历（${specifiedDate}）` : "麦当劳活动日历";
-    await sendTelegraphArticle(ctx, title, rawText, "活动日历已生成");
+    const cacheKey = getToolCacheKey("campaign-calender", args);
+    await sendTelegraphArticle(ctx, title, cleaned, "活动日历已生成", cacheKey);
   } catch (error) {
     ctx.reply(`活动日历查询失败：${error.message}`);
   }
@@ -771,7 +911,9 @@ async function handleAvailableCoupons(ctx) {
   try {
     const result = await callToolWithToken(info.account.token, "available-coupons", {});
     const rawText = getToolRawText(result);
-    await sendTelegraphArticle(ctx, "麦麦省优惠券列表", rawText, "优惠券列表已生成");
+    const cleaned = normalizeCouponListText(rawText);
+    const cacheKey = getToolCacheKey("available-coupons", {});
+    await sendTelegraphArticle(ctx, "麦麦省优惠券列表", cleaned, "优惠券列表已生成", cacheKey);
   } catch (error) {
     ctx.reply(`优惠券列表查询失败：${error.message}`);
   }
@@ -783,7 +925,10 @@ async function handleClaimCoupons(ctx) {
 
   try {
     const result = await callToolWithToken(info.account.token, "auto-bind-coupons", {});
-    const text = formatToolResult(result);
+    const rawText = getToolRawText(result);
+    const normalized = normalizeToolText(rawText);
+    recordClaimedCoupons(normalized, { userId: info.userId, accountId: info.accountId, reason: "manual" });
+    const text = formatTelegramHtml(stripImagesFromText(normalized));
     await sendLongMessage(ctx, text || "未返回数据。");
   } catch (error) {
     ctx.reply(`一键领券失败：${error.message}`);
@@ -800,19 +945,6 @@ async function handleMyCoupons(ctx) {
     await sendLongMessage(ctx, text || "未返回数据。");
   } catch (error) {
     ctx.reply(`我的优惠券查询失败：${error.message}`);
-  }
-}
-
-async function handleTimeInfo(ctx) {
-  const info = ensureAccount(ctx);
-  if (!info) return;
-
-  try {
-    const result = await callToolWithToken(info.account.token, "now-time-info", {});
-    const text = formatToolResult(result);
-    await sendLongMessage(ctx, text || "未返回数据。");
-  } catch (error) {
-    ctx.reply(`时间查询失败：${error.message}`);
   }
 }
 
@@ -860,10 +992,6 @@ bot.command("mycoupons", async (ctx) => {
   await handleMyCoupons(ctx);
 });
 
-bot.command("time", async (ctx) => {
-  await handleTimeInfo(ctx);
-});
-
 bot.command("autoclaim", (ctx) => {
   const args = parseCommandArgs(ctx);
   const setting = args[0] ? args[0].toLowerCase() : "";
@@ -904,11 +1032,6 @@ bot.command("autoclaimreport", (ctx) => {
 bot.action("menu_calendar", async (ctx) => {
   await ctx.answerCbQuery();
   await handleCalendar(ctx, null);
-});
-
-bot.action("menu_time", async (ctx) => {
-  await ctx.answerCbQuery();
-  await handleTimeInfo(ctx);
 });
 
 bot.action("menu_available", async (ctx) => {
@@ -972,6 +1095,7 @@ bot.action("menu_token_help", async (ctx) => {
 });
 
 const autoClaimInProgress = new Set();
+let autoClaimSweepInProgress = false;
 
 function hashString(input) {
   let hash = 0;
@@ -981,80 +1105,214 @@ function hashString(input) {
   return hash;
 }
 
-function shouldRunAutoClaim(userId, accountId, today, nowMinutes) {
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function getDailyTargetMinute(userId, accountId, today) {
   const startMinutes = AUTO_CLAIM_HOUR * 60;
-  if (nowMinutes < startMinutes) {
-    return false;
-  }
   const maxWindow = 24 * 60 - startMinutes;
   const windowMinutes = Math.max(1, Math.min(AUTO_CLAIM_SPREAD_MINUTES, maxWindow));
   const seed = `${userId}:${accountId}:${today}`;
   const offset = hashString(seed) % windowMinutes;
-  const targetMinute = startMinutes + offset;
+  return startMinutes + offset;
+}
+
+function shouldRunAutoClaim(userId, accountId, today, nowMinutes) {
+  const targetMinute = getDailyTargetMinute(userId, accountId, today);
   return nowMinutes >= targetMinute;
 }
 
-async function runAutoClaimSweep() {
-  const users = allUsers();
-  const today = getLocalDate(AUTO_CLAIM_TIMEZONE);
-  const nowMinutes = getMinutesSinceMidnight(AUTO_CLAIM_TIMEZONE);
-  if (!Number.isFinite(nowMinutes)) {
+function getActiveBurst() {
+  const state = getGlobalState();
+  const burst = state.burst;
+  if (!burst || !burst.startAt || !burst.endAt) {
+    if (burst) {
+      updateGlobalState({ burst: null });
+    }
+    return null;
+  }
+  if (Date.now() >= burst.endAt) {
+    updateGlobalState({ burst: null });
+    return null;
+  }
+  return burst;
+}
+
+function getBurstTargetAt(userId, accountId, burst) {
+  const windowMs = Math.max(1, burst.endAt - burst.startAt);
+  const seed = `${burst.id}:${userId}:${accountId}`;
+  const offsetMs = hashString(seed) % windowMs;
+  return burst.startAt + offsetMs;
+}
+
+function shouldRunBurst(userId, accountId, burst, nowMs) {
+  if (!burst || !burst.startAt || !burst.endAt) {
+    return false;
+  }
+  if (nowMs < burst.startAt || nowMs > burst.endAt) {
+    return false;
+  }
+  const targetAt = getBurstTargetAt(userId, accountId, burst);
+  return nowMs >= targetAt;
+}
+
+function ensureBurstScheduler(enabled) {
+  if (!enabled || !GLOBAL_BURST_CHECK_SECONDS || GLOBAL_BURST_CHECK_SECONDS <= 0) {
+    if (burstInterval) {
+      clearInterval(burstInterval);
+      burstInterval = null;
+    }
     return;
   }
+  if (burstInterval) {
+    return;
+  }
+  burstInterval = setInterval(() => {
+    runAutoClaimSweep().catch((error) => {
+      console.error("Burst auto-claim sweep failed", error);
+    });
+  }, GLOBAL_BURST_CHECK_SECONDS * 1000);
+}
 
-  for (const [userId, user] of Object.entries(users)) {
-    const accounts = user.accounts || {};
-    for (const [accountId, account] of Object.entries(accounts)) {
-      if (!account || !account.token) {
-        continue;
+async function runAutoClaimSweep() {
+  if (autoClaimSweepInProgress) {
+    return;
+  }
+  autoClaimSweepInProgress = true;
+
+  try {
+    const users = allUsers();
+    const nowMs = Date.now();
+    const burst = getActiveBurst();
+    ensureBurstScheduler(Boolean(burst));
+    const today = getLocalDate(AUTO_CLAIM_TIMEZONE);
+    const nowMinutes = getMinutesSinceMidnight(AUTO_CLAIM_TIMEZONE);
+    if (!Number.isFinite(nowMinutes)) {
+      return;
+    }
+
+    const tasks = [];
+
+    for (const [userId, user] of Object.entries(users)) {
+      const accounts = user.accounts || {};
+      for (const [accountId, account] of Object.entries(accounts)) {
+        if (!account || !account.token) {
+          continue;
+        }
+        if (!account.autoClaimEnabled) {
+          continue;
+        }
+
+        if (burst) {
+          if (account.lastBurstId === burst.id) {
+            continue;
+          }
+          if (!shouldRunBurst(userId, accountId, burst, nowMs)) {
+            continue;
+          }
+        } else {
+          if (account.lastAutoClaimDate === today) {
+            continue;
+          }
+          if (!shouldRunAutoClaim(userId, accountId, today, nowMinutes)) {
+            continue;
+          }
+        }
+
+        const taskKey = `${userId}:${accountId}`;
+        if (autoClaimInProgress.has(taskKey)) {
+          continue;
+        }
+
+        const displayName = getAccountDisplayName(accountId, account);
+        const targetMinute = burst ? null : getDailyTargetMinute(userId, accountId, today);
+        const targetAt = burst ? getBurstTargetAt(userId, accountId, burst) : null;
+        tasks.push({
+          userId,
+          accountId,
+          account,
+          displayName,
+          reason: burst ? "burst" : "daily",
+          targetMinute,
+          targetAt
+        });
       }
-      if (!account.autoClaimEnabled) {
-        continue;
-      }
-      if (account.lastAutoClaimDate === today) {
-        continue;
-      }
-      if (!shouldRunAutoClaim(userId, accountId, today, nowMinutes)) {
-        continue;
+    }
+
+    if (tasks.length === 0) {
+      return;
+    }
+
+    if (burst) {
+      tasks.sort((a, b) => (a.targetAt || 0) - (b.targetAt || 0));
+    } else {
+      tasks.sort((a, b) => (a.targetMinute || 0) - (b.targetMinute || 0));
+    }
+
+    const maxPerSweep = AUTO_CLAIM_MAX_PER_SWEEP > 0 ? AUTO_CLAIM_MAX_PER_SWEEP : tasks.length;
+    let remaining = maxPerSweep;
+    let nextAllowedAt = getGlobalState().lastAutoClaimRequestAt || 0;
+
+    for (const task of tasks) {
+      if (remaining <= 0) {
+        break;
       }
 
-      const taskKey = `${userId}:${accountId}`;
-      if (autoClaimInProgress.has(taskKey)) {
-        continue;
+      if (AUTO_CLAIM_REQUEST_GAP_MS > 0) {
+        const waitMs = nextAllowedAt - Date.now();
+        if (waitMs > 0) {
+          await sleep(waitMs);
+        }
       }
 
+      const taskKey = `${task.userId}:${task.accountId}`;
       autoClaimInProgress.add(taskKey);
-      const displayName = getAccountDisplayName(accountId, account);
+      const requestAt = Date.now();
+      if (AUTO_CLAIM_REQUEST_GAP_MS > 0) {
+        nextAllowedAt = requestAt + AUTO_CLAIM_REQUEST_GAP_MS;
+      }
+      updateGlobalState({ lastAutoClaimRequestAt: requestAt });
+
       try {
-        const result = await callToolWithToken(account.token, "auto-bind-coupons", {});
+        const result = await callToolWithToken(task.account.token, "auto-bind-coupons", {});
         const rawText = getToolRawText(result);
-        const claimed = hasClaimedCoupons(rawText);
+        const normalized = normalizeToolText(rawText);
+        const claimed = hasClaimedCoupons(normalized);
+        recordClaimedCoupons(normalized, {
+          userId: task.userId,
+          accountId: task.accountId,
+          reason: task.reason
+        });
+
         const message = [
-          `自动领券结果（${today}）- 账号：${displayName}`,
+          `自动领券结果（${today}）- 账号：${task.displayName}`,
           "",
-          formatTelegramHtml(stripImagesFromText(rawText))
+          formatTelegramHtml(stripImagesFromText(normalized))
         ].join("\n");
 
-        if (account.autoClaimReportSuccess !== false && claimed) {
-          await sendLongMessageToUser(userId, message);
+        if (task.account.autoClaimReportSuccess !== false && claimed) {
+          await sendLongMessageToUser(task.userId, message);
         }
-        updateAccount(userId, accountId, {
+        updateAccount(task.userId, task.accountId, {
           lastAutoClaimDate: today,
           lastAutoClaimAt: getLocalDateTime(AUTO_CLAIM_TIMEZONE),
-          lastAutoClaimStatus: "成功"
+          lastAutoClaimStatus: "成功",
+          lastBurstId: task.reason === "burst" ? burst.id : task.account.lastBurstId
         });
       } catch (error) {
-        updateAccount(userId, accountId, {
+        updateAccount(task.userId, task.accountId, {
           lastAutoClaimDate: today,
           lastAutoClaimAt: getLocalDateTime(AUTO_CLAIM_TIMEZONE),
-          lastAutoClaimStatus: `失败：${error.message}`
+          lastAutoClaimStatus: `失败：${error.message}`,
+          lastBurstId: task.reason === "burst" ? burst.id : task.account.lastBurstId
         });
 
-        if (account.autoClaimReportFailure !== false) {
+        if (task.account.autoClaimReportFailure !== false) {
           try {
             await sendLongMessageToUser(
-              userId,
-              `自动领券失败（${today}）- 账号：${displayName}\n${error.message}`
+              task.userId,
+              `自动领券失败（${today}）- 账号：${task.displayName}\n${error.message}`
             );
           } catch (sendError) {
             console.error("Failed to send auto-claim error to user", sendError);
@@ -1062,8 +1320,11 @@ async function runAutoClaimSweep() {
         }
       } finally {
         autoClaimInProgress.delete(taskKey);
+        remaining -= 1;
       }
     }
+  } finally {
+    autoClaimSweepInProgress = false;
   }
 }
 
@@ -1089,7 +1350,6 @@ bot.launch()
       { command: "coupons", description: "可领优惠券列表" },
       { command: "claim", description: "一键领券" },
       { command: "mycoupons", description: "我的优惠券" },
-      { command: "time", description: "当前时间信息" },
       { command: "autoclaim", description: "每日自动领券开关" },
       { command: "autoclaimreport", description: "自动领券汇报开关(成/败)" },
       { command: "status", description: "查看账号状态" },
@@ -1111,6 +1371,10 @@ function shutdown(signal) {
   if (autoClaimInterval) {
     clearInterval(autoClaimInterval);
     autoClaimInterval = null;
+  }
+  if (burstInterval) {
+    clearInterval(burstInterval);
+    burstInterval = null;
   }
   bot.stop(signal);
 }
