@@ -85,7 +85,7 @@ if (!BOT_TOKEN) {
   process.exit(1);
 }
 
-const MCP_URL = process.env.MCD_MCP_URL || "https://mcp.mcd.cn/mcp-servers/mcd-mcp";
+const MCP_URL = process.env.MCD_MCP_URL || "https://mcp.mcd.cn";
 const MCP_PROTOCOL_VERSION = process.env.MCP_PROTOCOL_VERSION || "2025-06-18";
 const MCP_REQUEST_TIMEOUT_MS = readNumberEnv("MCP_REQUEST_TIMEOUT_MS", 30000, { min: 0 });
 const MCP_CLIENT_CACHE_TTL_SECONDS = readNumberEnv("MCP_CLIENT_CACHE_TTL_SECONDS", 1800, { min: 0 });
@@ -118,7 +118,7 @@ const MCP_RETRY_OPTIONS = {
 
 const CACHE_TTL_SECONDS = readNumberEnv("CACHE_TTL_SECONDS", 300, { min: 0 });
 const CACHEABLE_TOOLS = new Set(
-  (process.env.CACHEABLE_TOOLS || "campaign-calender,available-coupons")
+  (process.env.CACHEABLE_TOOLS || "campaign-calendar,list-nutrition-foods")
     .split(",")
     .map((value) => value.trim())
     .filter(Boolean)
@@ -147,6 +147,8 @@ const cache = new TTLCache(CACHE_TTL_SECONDS * 1000);
 const telegraphCache = new TTLCache(CACHE_TTL_SECONDS * 1000);
 const mcpClientCache =
   MCP_CLIENT_CACHE_TTL_SECONDS > 0 ? new TTLCache(MCP_CLIENT_CACHE_TTL_SECONDS * 1000) : null;
+const availableToolsCache =
+  MCP_CLIENT_CACHE_TTL_SECONDS > 0 ? new TTLCache(MCP_CLIENT_CACHE_TTL_SECONDS * 1000) : null;
 const bot = new Telegraf(BOT_TOKEN);
 let autoClaimInterval = null;
 let burstInterval = null;
@@ -156,6 +158,84 @@ const userRateLimits = new Map();
 
 const ACCOUNT_ID_PATTERN = /^[A-Za-z0-9._\-\u4e00-\u9fff]+$/;
 const TOKEN_PATTERN = /^[A-Za-z0-9._=-]+$/;
+const KNOWN_MCP_TOOLS = {
+  calendar: {
+    names: ["campaign-calendar", "campaign-calender"],
+    label: "活动日历"
+  },
+  availableCoupons: {
+    names: ["available-coupons"],
+    label: "麦麦省可领优惠券"
+  },
+  claimCoupons: {
+    names: ["auto-bind-coupons"],
+    label: "麦麦省一键领券"
+  },
+  myCoupons: {
+    names: ["query-my-coupons", "my-coupons"],
+    label: "我的优惠券"
+  },
+  myAccount: {
+    names: ["query-my-account"],
+    label: "我的积分"
+  },
+  nutritionFoods: {
+    names: ["list-nutrition-foods"],
+    label: "餐品营养信息"
+  },
+  deliveryAddresses: {
+    names: ["delivery-query-addresses"],
+    label: "配送地址列表"
+  },
+  createDeliveryAddress: {
+    names: ["delivery-create-address"],
+    label: "新增配送地址"
+  },
+  nearbyStores: {
+    names: ["query-nearby-stores"],
+    label: "附近门店"
+  },
+  storeCoupons: {
+    names: ["query-store-coupons"],
+    label: "门店可用券"
+  },
+  meals: {
+    names: ["query-meals"],
+    label: "门店菜单"
+  },
+  mealDetail: {
+    names: ["query-meal-detail"],
+    label: "餐品详情"
+  },
+  calculatePrice: {
+    names: ["calculate-price"],
+    label: "价格计算"
+  },
+  createOrder: {
+    names: ["create-order"],
+    label: "创建订单"
+  },
+  queryOrder: {
+    names: ["query-order"],
+    label: "查询订单"
+  },
+  mallProducts: {
+    names: ["mall-points-products"],
+    label: "积分商城商品"
+  },
+  mallProductDetail: {
+    names: ["mall-product-detail"],
+    label: "积分商城商品详情"
+  },
+  mallCreateOrder: {
+    names: ["mall-create-order"],
+    label: "积分商城兑换下单"
+  },
+  nowTimeInfo: {
+    names: ["now-time-info"],
+    label: "当前时间信息"
+  }
+};
 
 function logAutoClaim(message, extra) {
   if (extra !== undefined) {
@@ -213,12 +293,58 @@ const ACCOUNT_HELP_MESSAGE = [
 const MAIN_MENU = Markup.inlineKeyboard([
   [Markup.button.callback("活动日历（本月）", "menu_calendar"), Markup.button.callback("可领优惠券", "menu_available")],
   [Markup.button.callback("一键领券", "menu_claim"), Markup.button.callback("我的优惠券", "menu_mycoupons")],
+  [Markup.button.callback("积分查询", "menu_points"), Markup.button.callback("当前时间", "menu_now")],
   [Markup.button.callback("账号状态", "menu_status"), Markup.button.callback("我的统计", "menu_stats")],
-  [Markup.button.callback("账号管理", "menu_accounts"), Markup.button.callback("Token 获取指引", "menu_token_help")],
+  [Markup.button.callback("账号管理", "menu_accounts"), Markup.button.callback("完整帮助", "menu_help")],
+  [Markup.button.callback("Token 获取指引", "menu_token_help"), Markup.button.callback("更多能力", "menu_more")],
   [Markup.button.callback("开启自动领券", "menu_autoclaim_on"), Markup.button.callback("关闭自动领券", "menu_autoclaim_off")],
   [Markup.button.callback("开启成功汇报", "menu_report_success_on"), Markup.button.callback("关闭成功汇报", "menu_report_success_off")],
   [Markup.button.callback("开启失败汇报", "menu_report_fail_on"), Markup.button.callback("关闭失败汇报", "menu_report_fail_off")]
 ]);
+
+function buildQuickHelpMessage() {
+  return [
+    "欢迎使用麦麦 MCP 机器人。",
+    "",
+    TOKEN_GUIDE_MESSAGE,
+    "",
+    "常用指令：",
+    "/token 你的MCP_TOKEN（首次会创建默认账号）",
+    "/calendar [YYYY-MM-DD] - 活动日历查询",
+    "/coupons - 麦麦省可领取券列表",
+    "/claim - 麦麦省一键领券",
+    "/mycoupons - 我的优惠券",
+    "/points - 我的积分",
+    "/tools - 当前账号可用 MCP 工具",
+    "/help - 查看完整指令"
+  ].join("\n");
+}
+
+function buildAdvancedFeatureMessage() {
+  return [
+    "新增能力：",
+    "/nutrition [关键词] - 餐品营养信息",
+    "/mall list - 积分商城商品列表",
+    "/mall detail <spuId> - 积分商品详情",
+    "/mall redeem <skuId> [count] - 积分兑换商品券",
+    "/stores fav - 到店收藏门店",
+    "/stores search 城市 关键词 - 按位置搜索门店",
+    "/deliveryaddrs mls|group - 查询配送地址",
+    "/deliveryadd mls|group 城市|联系人|电话|地址|门牌|性别(可选) - 新增配送地址",
+    "/storecoupons <storeCode> <pickup|delivery> [beCode] - 查询门店可用券",
+    "/meals <storeCode> <pickup|delivery> [beCode] - 查询门店菜单",
+    "/mealdetail <code> <storeCode> <pickup|delivery> [beCode] - 查询餐品详情",
+    "/price <json> - 价格计算",
+    "/order create <json> - 创建订单",
+    "/order query <orderId> - 查询订单",
+    "/now - 当前时间信息",
+    "/tool <toolName> [json] - 原始调用任意当前 MCP 工具"
+  ].join("\n");
+}
+
+function buildHelpMessage() {
+  return [buildQuickHelpMessage(), "", ACCOUNT_HELP_MESSAGE, "", buildAdvancedFeatureMessage()].join("\n");
+}
 
 function chunkText(text, maxLength = 3500) {
   const lines = text.split("\n");
@@ -425,6 +551,211 @@ function getToolRawText(result) {
   }
 
   return rawText;
+}
+
+function extractBalancedJsonFragment(text, startIndex) {
+  if (!text || startIndex < 0 || startIndex >= text.length) {
+    return "";
+  }
+  const opening = text[startIndex];
+  if (opening !== "{" && opening !== "[") {
+    return "";
+  }
+
+  const stack = [opening];
+  let inString = false;
+  let escaping = false;
+
+  for (let index = startIndex + 1; index < text.length; index += 1) {
+    const char = text[index];
+    if (escaping) {
+      escaping = false;
+      continue;
+    }
+    if (char === "\\") {
+      escaping = true;
+      continue;
+    }
+    if (char === "\"") {
+      inString = !inString;
+      continue;
+    }
+    if (inString) {
+      continue;
+    }
+    if (char === "{" || char === "[") {
+      stack.push(char);
+      continue;
+    }
+    if (char === "}" || char === "]") {
+      const expected = char === "}" ? "{" : "[";
+      if (stack[stack.length - 1] !== expected) {
+        return "";
+      }
+      stack.pop();
+      if (!stack.length) {
+        return text.slice(startIndex, index + 1);
+      }
+    }
+  }
+
+  return "";
+}
+
+function findJsonFragment(text) {
+  const source = String(text || "");
+  if (!source.trim()) {
+    return "";
+  }
+
+  const marker = source.lastIndexOf("## Original Response");
+  if (marker >= 0) {
+    for (let index = marker; index < source.length; index += 1) {
+      if (source[index] !== "{" && source[index] !== "[") {
+        continue;
+      }
+      const fragment = extractBalancedJsonFragment(source, index);
+      if (!fragment) {
+        continue;
+      }
+      try {
+        JSON.parse(fragment);
+        return fragment;
+      } catch (error) {
+        continue;
+      }
+    }
+  }
+
+  const candidateStarts = [];
+
+  for (let index = 0; index < source.length; index += 1) {
+    if (source[index] === "{" || source[index] === "[") {
+      candidateStarts.push(index);
+    }
+  }
+
+  const tried = new Set();
+  let lastValid = "";
+  for (const startIndex of candidateStarts) {
+    if (tried.has(startIndex)) {
+      continue;
+    }
+    tried.add(startIndex);
+    const fragment = extractBalancedJsonFragment(source, startIndex);
+    if (!fragment) {
+      continue;
+    }
+    try {
+      JSON.parse(fragment);
+      if (!lastValid || fragment.length > lastValid.length) {
+        lastValid = fragment;
+      }
+    } catch (error) {
+      continue;
+    }
+  }
+  return lastValid;
+}
+
+function extractOriginalResponseText(rawText) {
+  const source = String(rawText || "");
+  const marker = source.lastIndexOf("## Original Response");
+  if (marker < 0) {
+    return source;
+  }
+  return source.slice(marker + "## Original Response".length).trim();
+}
+
+function extractOriginalResponseDataString(rawText) {
+  const source = extractOriginalResponseText(rawText);
+  const match = source.match(/"data":"([\s\S]*)"\s*}$/);
+  if (!match) {
+    return "";
+  }
+  return match[1]
+    .replace(/\\"/g, "\"")
+    .replace(/\\n/g, "\n")
+    .replace(/\\\\/g, "\\");
+}
+
+function getStructuredContentPayload(result) {
+  if (!result || typeof result !== "object" || Array.isArray(result)) {
+    return null;
+  }
+  const structured = result.structuredContent;
+  if (!structured || typeof structured !== "object" || Array.isArray(structured)) {
+    return null;
+  }
+  return structured;
+}
+
+function parseToolJsonPayload(result) {
+  const structured = getStructuredContentPayload(result);
+  if (structured) {
+    return structured;
+  }
+
+  if (result && typeof result === "object" && !Array.isArray(result)) {
+    if (result.success !== undefined || result.code !== undefined || result.data !== undefined) {
+      return result;
+    }
+  }
+
+  const rawText = getToolRawText(result);
+  if (!rawText) {
+    return null;
+  }
+
+  const candidates = [normalizeToolText(rawText), rawText.trim()].filter(Boolean);
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate);
+      if (parsed && typeof parsed === "object") {
+        return parsed;
+      }
+    } catch (error) {
+      continue;
+    }
+  }
+
+  const fragment = findJsonFragment(rawText);
+  if (fragment) {
+    try {
+      return JSON.parse(fragment);
+    } catch (error) {
+      return null;
+    }
+  }
+
+  return null;
+}
+
+function getStructuredToolData(result) {
+  const payload = parseToolJsonPayload(result);
+  if (!payload || typeof payload !== "object") {
+    return null;
+  }
+  return payload.data !== undefined ? payload.data : payload;
+}
+
+function formatJsonCodeBlock(value) {
+  return formatTelegramHtml(`\`\`\`json\n${JSON.stringify(value, null, 2)}\n\`\`\``);
+}
+
+function formatFenAmount(value) {
+  const amount = Number(value);
+  if (!Number.isFinite(amount)) {
+    return String(value || "0");
+  }
+  return `¥${(amount / 100).toFixed(2)}`;
+}
+
+function formatCurrencyValue(value) {
+  if (value === undefined || value === null || value === "") {
+    return "0";
+  }
+  return String(value);
 }
 
 function normalizeToolText(rawText, options = {}) {
@@ -926,6 +1257,456 @@ function parseCommandArgs(ctx) {
   return text.split(/\s+/).slice(1).filter(Boolean);
 }
 
+function getCommandPayload(ctx) {
+  const text = ctx.message && ctx.message.text ? ctx.message.text : "";
+  const match = text.match(/^\/\S+(?:\s+([\s\S]*))?$/);
+  return match && match[1] ? match[1].trim() : "";
+}
+
+function splitFirstToken(text) {
+  const payload = String(text || "").trim();
+  if (!payload) {
+    return { head: "", tail: "" };
+  }
+  const match = payload.match(/^(\S+)(?:\s+([\s\S]*))?$/);
+  return {
+    head: match ? match[1] : payload,
+    tail: match && match[2] ? match[2].trim() : ""
+  };
+}
+
+function parseJsonPayload(text, usageText) {
+  const payload = String(text || "").trim();
+  if (!payload) {
+    return { ok: false, message: usageText || "缺少 JSON 参数。" };
+  }
+  try {
+    const value = JSON.parse(payload);
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      return { ok: false, message: "JSON 参数必须是对象。" };
+    }
+    return { ok: true, value };
+  } catch (error) {
+    return { ok: false, message: `JSON 解析失败：${sanitizeInlineText(error.message, { maxLength: 120 })}` };
+  }
+}
+
+function parsePipeFields(text) {
+  return String(text || "")
+    .split("|")
+    .map((value) => value.trim())
+    .filter((value, index, list) => value || index < list.length - 1);
+}
+
+function normalizeDeliveryTypeInput(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (["2", "mls", "delivery", "deliver", "麦乐送", "外送"].includes(normalized)) {
+    return { ok: true, value: 2, label: "麦乐送" };
+  }
+  if (["6", "group", "corp", "enterprise", "团餐"].includes(normalized)) {
+    return { ok: true, value: 6, label: "团餐" };
+  }
+  return { ok: false, message: "类型仅支持 mls|group（或 2|6）。" };
+}
+
+function normalizeOrderTypeInput(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (["1", "pickup", "takeout", "instore", "store", "到店", "堂食"].includes(normalized)) {
+    return { ok: true, value: 1, label: "到店" };
+  }
+  if (["2", "delivery", "deliver", "外送", "麦乐送", "团餐"].includes(normalized)) {
+    return { ok: true, value: 2, label: "外送" };
+  }
+  return { ok: false, message: "取餐方式仅支持 pickup|delivery（或 1|2）。" };
+}
+
+function buildStoreToolArgs(storeCode, orderTypeInput, beCode) {
+  if (!storeCode) {
+    return { ok: false, message: "缺少 storeCode。" };
+  }
+  const orderType = normalizeOrderTypeInput(orderTypeInput);
+  if (!orderType.ok) {
+    return orderType;
+  }
+  if (orderType.value === 2 && !beCode) {
+    return { ok: false, message: "外送场景必须提供 beCode。" };
+  }
+  return {
+    ok: true,
+    value: {
+      storeCode,
+      orderType: orderType.value,
+      ...(orderType.value === 2 ? { beCode } : {})
+    },
+    orderType
+  };
+}
+
+function parseCompactTableText(text) {
+  const source = String(text || "").trim();
+  const match = source.match(/^\[\d+\]\{([^}]+)\}:\s*([\s\S]*)$/);
+  if (!match) {
+    return [];
+  }
+  const fields = match[1].split(",").map((value) => value.trim()).filter(Boolean);
+  const body = match[2]
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  return body.map((line) => {
+    const values = line.split(",").map((value) => value.trim());
+    return fields.reduce((acc, field, index) => {
+      acc[field] = values[index] !== undefined ? values[index] : "";
+      return acc;
+    }, {});
+  });
+}
+
+function formatToolListMessage(toolNames) {
+  const names = Array.from(toolNames || []).filter(Boolean).sort();
+  if (!names.length) {
+    return "当前账号未返回可用工具。";
+  }
+  return ["当前账号可用 MCP 工具：", `共 ${names.length} 个`, ...names.map((name) => `- ${name}`)].join("\n");
+}
+
+function formatPointsText(data) {
+  if (!data || typeof data !== "object") {
+    return "未返回积分数据。";
+  }
+  return [
+    "我的积分：",
+    `可用积分：${formatCurrencyValue(data.availablePoint)}`,
+    `累计积分：${formatCurrencyValue(data.accumulativePoint)}`,
+    `已使用积分：${formatCurrencyValue(data.usedPoint)}`,
+    `冻结积分：${formatCurrencyValue(data.frozenPoint)}`,
+    `本月将过期：${formatCurrencyValue(data.currentMouthExpirePoint)}`,
+    `下月将过期：${formatCurrencyValue(data.nextMouthExpirePoint)}`,
+    `已过期积分：${formatCurrencyValue(data.expiredPoint)}`
+  ].join("\n");
+}
+
+function formatMallProductsText(data) {
+  const items = Array.isArray(data) ? data : [];
+  if (!items.length) {
+    return "当前没有可兑换商品。";
+  }
+  const lines = [`积分商城商品：共 ${items.length} 个`];
+  for (const item of items) {
+    lines.push(
+      [
+        `- ${item.spuName || "未命名商品"}`,
+        `  spuId: ${item.spuId || "-"}`,
+        `  skuId: ${item.skuId || "-"}`,
+        `  所需积分: ${formatCurrencyValue(item.point)}`,
+        `  有效期: ${item.upTime || "-"} ~ ${item.downTime || "-"}`
+      ].join("\n")
+    );
+  }
+  return lines.join("\n");
+}
+
+function formatMallProductDetailText(data) {
+  if (!data || typeof data !== "object") {
+    return "未返回商品详情。";
+  }
+  const images = Array.isArray(data.images) ? data.images : [];
+  const lines = [
+    `商品：${data.spuName || "未命名商品"}`,
+    `spuId: ${data.spuId || "-"}`,
+    `skuId: ${data.skuId || "-"}`,
+    `所需积分: ${formatCurrencyValue(data.points)}`,
+    `参考价格: ${data.extTradePrice || "-"}`,
+    `有效期: ${data.upDate || "-"} ~ ${data.downDate || "-"}`
+  ];
+  if (data.note) {
+    lines.push(`说明: ${data.note}`);
+  }
+  if (data.detail) {
+    lines.push(`详情: ${data.detail}`);
+  }
+  if (images.length) {
+    lines.push(`图片: ${images.join("\n")}`);
+  }
+  return lines.join("\n");
+}
+
+function formatMallRedeemText(data) {
+  if (!data || typeof data !== "object") {
+    return "未返回兑换结果。";
+  }
+  const coupons = Array.isArray(data.coupons) ? data.coupons : [];
+  const lines = [
+    "积分兑换结果：",
+    `订单号: ${data.orderId || "-"}`,
+    `订单状态: ${data.orderStatus || "-"}`,
+    `兑换状态: ${data.status || "-"}`
+  ];
+  if (coupons.length) {
+    lines.push("发放券码：");
+    for (const coupon of coupons) {
+      lines.push(
+        [
+          `- couponId: ${coupon.couponId || "-"}`,
+          `  orderItemId: ${coupon.orderItemId || "-"}`,
+          `  couponCodes: ${Array.isArray(coupon.couponCodes) ? coupon.couponCodes.join(", ") : "-"}`
+        ].join("\n")
+      );
+    }
+  }
+  return lines.join("\n");
+}
+
+function formatDeliveryAddressesText(data, label) {
+  const addresses = data && Array.isArray(data.addresses) ? data.addresses : [];
+  if (!addresses.length) {
+    return `${label}地址为空。`;
+  }
+  const lines = [`${label}地址：共 ${addresses.length} 个`];
+  for (const item of addresses) {
+    lines.push(
+      [
+        `- ${item.contactName || "未命名联系人"} ${item.phone || ""}`.trim(),
+        `  addressId: ${item.addressId || "-"}`,
+        `  地址: ${item.fullAddress || "-"}`,
+        `  门店: ${item.storeName || "-"} (${item.storeCode || "-"})`,
+        `  beCode: ${item.beCode || "-"}`
+      ].join("\n")
+    );
+  }
+  return lines.join("\n");
+}
+
+function formatNearbyStoresText(data) {
+  const stores = Array.isArray(data) ? data : [];
+  if (!stores.length) {
+    return "未找到门店。";
+  }
+  const lines = [`附近门店：共 ${stores.length} 家`];
+  for (const item of stores) {
+    lines.push(
+      [
+        `- ${item.storeName || "未命名门店"} (${item.storeCode || "-"})`,
+        `  地址: ${item.address || "-"}`,
+        `  beCode: ${item.beCode || "-"}`,
+        `  距离: ${item.distance || "-"}`
+      ].join("\n")
+    );
+  }
+  return lines.join("\n");
+}
+
+function formatStoreCouponsText(data) {
+  const coupons = Array.isArray(data) ? data : [];
+  if (!coupons.length) {
+    return "当前门店没有可用券。";
+  }
+  const lines = [`当前门店可用券：共 ${coupons.length} 张`];
+  for (const item of coupons) {
+    const products = Array.isArray(item.products) ? item.products : [];
+    const productText = products.length
+      ? products.map((product) => `${product.productName || "-"}(${product.productCode || "-"})`).join("、")
+      : "-";
+    lines.push(
+      [
+        `- ${item.title || "未命名优惠券"}`,
+        `  couponId: ${item.couponId || "-"}`,
+        `  couponCode: ${item.couponCode || "-"}`,
+        `  有效期: ${item.tradeDateTime || "-"}`,
+        `  适用品: ${productText}`
+      ].join("\n")
+    );
+  }
+  return lines.join("\n");
+}
+
+function formatMealsText(data) {
+  const categories = data && Array.isArray(data.categories) ? data.categories : [];
+  const meals = data && data.meals && typeof data.meals === "object" ? data.meals : {};
+  if (!categories.length) {
+    return "当前门店没有返回可售餐品。";
+  }
+  const lines = ["当前门店菜单："];
+  for (const category of categories) {
+    lines.push(`\n${category.name || "未分类"}：`);
+    const list = Array.isArray(category.meals) ? category.meals : [];
+    for (const item of list) {
+      const detail = meals[item.code] || {};
+      const tags = Array.isArray(item.tags) && item.tags.length ? `｜标签:${item.tags.join("、")}` : "";
+      lines.push(`- ${detail.name || item.code || "未知餐品"}｜code:${item.code || "-"}｜价格:${detail.currentPrice || "-"}${tags}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+function formatMealDetailText(data) {
+  if (!data || typeof data !== "object") {
+    return "未返回餐品详情。";
+  }
+  const lines = [
+    `餐品编码: ${data.code || "-"}`,
+    `价格: ${data.price || "-"}`,
+    "套餐组成："
+  ];
+  const rounds = Array.isArray(data.rounds) ? data.rounds : [];
+  if (!rounds.length) {
+    lines.push("- 无");
+    return lines.join("\n");
+  }
+  for (const round of rounds) {
+    lines.push(
+      `- ${round.name || "未命名分组"}｜数量:${round.quantity || 0}｜最少:${round.minQuantity || 0}｜最多:${round.maxQuantity || 0}`
+    );
+    const choices = Array.isArray(round.choices) ? round.choices : [];
+    for (const choice of choices) {
+      lines.push(`  • ${choice.name || "未命名选项"}｜code:${choice.code || "-"}｜数量:${choice.quantity || 0}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+function formatPriceResultText(data) {
+  if (!data || typeof data !== "object") {
+    return "未返回价格计算结果。";
+  }
+  const lines = [
+    "价格计算结果：",
+    `商品原价: ${formatFenAmount(data.productOriginalPrice)}`,
+    `商品现价: ${formatFenAmount(data.productPrice)}`,
+    `配送原价: ${formatFenAmount(data.deliveryOriginalPrice)}`,
+    `配送现价: ${formatFenAmount(data.deliveryPrice)}`,
+    `优惠金额: ${formatFenAmount(data.discount)}`,
+    `应付总价: ${formatFenAmount(data.price)}`
+  ];
+  const products = Array.isArray(data.productList) ? data.productList : [];
+  if (products.length) {
+    lines.push("商品列表：");
+    for (const item of products) {
+      lines.push(
+        `- ${item.productName || item.productCode || "未命名商品"}｜code:${item.productCode || "-"}｜数量:${item.quantity || 0}｜小计:${formatFenAmount(item.subtotal)}`
+      );
+    }
+  }
+  const takeWays = Array.isArray(data.takeWayList) ? data.takeWayList : [];
+  if (takeWays.length) {
+    lines.push("到店取餐方式：");
+    for (const item of takeWays) {
+      lines.push(`- ${item.name || item.takeWayName || item.code || "-"}｜code:${item.code || item.takeWayCode || "-"}`);
+    }
+  }
+  const mealAssistance = Array.isArray(data.mealAssistanceList) ? data.mealAssistanceList : [];
+  if (mealAssistance.length) {
+    lines.push("助餐信息：");
+    for (const item of mealAssistance) {
+      lines.push(`- ${item.name || item.code || "-"}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+function formatOrderText(data, options = {}) {
+  const order = options.includeNestedDetail && data && data.orderDetail ? data.orderDetail : data;
+  if (!order || typeof order !== "object") {
+    return "未返回订单数据。";
+  }
+  const lines = [
+    options.title || "订单信息：",
+    `订单号: ${data.orderId || order.orderId || "-"}`,
+    `订单状态: ${order.orderStatus || "-"}`,
+    `门店: ${order.storeName || "-"}`,
+    `门店地址: ${order.storeAddress || "-"}`,
+    `商品金额: ${order.productPrice || "-"}`,
+    `配送费: ${order.realDeliveryPrice || order.deliveryPrice || "-"}`,
+    `优惠金额: ${order.totalDiscountAmount || "-"}`,
+    `应付总额: ${order.realTotalAmount || order.totalAmount || "-"}`
+  ];
+  if (data.payH5Url) {
+    lines.push(`支付链接: ${data.payH5Url}`);
+  }
+  if (order.createTime) {
+    lines.push(`创建时间: ${order.createTime}`);
+  }
+  if (order.takeWay) {
+    lines.push(`取餐方式: ${order.takeWay}`);
+  }
+  if (order.pickupCode) {
+    lines.push(`取餐码: ${order.pickupCode}`);
+  }
+  if (order.lockerCode) {
+    lines.push(`柜机码: ${order.lockerCode}`);
+  }
+  const products = Array.isArray(order.orderProductList) ? order.orderProductList : [];
+  if (products.length) {
+    lines.push("商品列表：");
+    for (const item of products) {
+      lines.push(`- ${item.productName || "-"}｜数量:${item.quantity || 0}｜价格:${item.price || "-"}`);
+      const combos = Array.isArray(item.comboItemList) ? item.comboItemList : [];
+      for (const combo of combos) {
+        lines.push(`  • ${combo.itemName || "-"} x ${combo.itemQuantity || 0}`);
+      }
+    }
+  }
+  const deliveryInfo = order.deliveryInfo;
+  if (deliveryInfo && typeof deliveryInfo === "object") {
+    lines.push("配送信息：");
+    lines.push(`- 类型: ${deliveryInfo.deliveryType || "-"}`);
+    lines.push(`- 地址: ${deliveryInfo.deliveryAddress || "-"} ${deliveryInfo.addressDetail || ""}`.trim());
+    lines.push(`- 联系人: ${deliveryInfo.customerNickname || "-"} ${deliveryInfo.mobilePhone || ""}`.trim());
+    lines.push(`- 预计送达: ${deliveryInfo.expectDeliveryTime || "-"}`);
+  }
+  return lines.join("\n");
+}
+
+function formatNowTimeText(data) {
+  if (!data || typeof data !== "object") {
+    return "未返回时间信息。";
+  }
+  return [
+    "当前时间信息：",
+    `格式化时间: ${data.formatted || "-"}`,
+    `日期: ${data.date || "-"}`,
+    `星期: ${data.dayOfWeek || "-"}`,
+    `时区: ${data.timezone || "-"} (${data.offset || "-"})`,
+    `UTC: ${data.utc || "-"}`,
+    `时间戳: ${data.timestamp || "-"}`
+  ].join("\n");
+}
+
+function formatNutritionText(result, keyword) {
+  const payload = parseToolJsonPayload(result);
+  const rawText = getToolRawText(result);
+  const compact =
+    payload && typeof payload.data === "string"
+      ? payload.data
+      : extractOriginalResponseDataString(rawText) || normalizeToolText(rawText);
+  const rows = parseCompactTableText(compact);
+  if (!rows.length) {
+    return normalizeToolText(rawText) || "未返回营养数据。";
+  }
+  const normalizedKeyword = String(keyword || "").trim().toLowerCase();
+  const filtered = normalizedKeyword
+    ? rows.filter((row) => String(row.productName || "").toLowerCase().includes(normalizedKeyword))
+    : rows;
+  if (!filtered.length) {
+    return `未找到包含“${sanitizeInlineText(keyword, { maxLength: 40 })}”的餐品。`;
+  }
+  const lines = [`餐品营养信息：共 ${filtered.length} 项`];
+  for (const item of filtered) {
+    lines.push(
+      `- ${item.productName || "未命名餐品"}｜${item.energyKcal || "-"} kcal｜蛋白质 ${item.protein || "-"}g｜脂肪 ${item.fat || "-"}g｜碳水 ${item.carbohydrate || "-"}g｜钠 ${item.sodium || "-"}mg`
+    );
+  }
+  return lines.join("\n");
+}
+
+function formatGenericToolResponse(result) {
+  const payload = parseToolJsonPayload(result);
+  if (payload) {
+    return formatJsonCodeBlock(payload);
+  }
+  return formatToolResult(result);
+}
+
 function formatTimestamp(ms, timeZone) {
   if (!ms) {
     return "无";
@@ -1246,8 +2027,97 @@ function removeAccount(userId, accountId) {
   return true;
 }
 
-function getToolCacheKey(toolName, args) {
-  return `${toolName}:${JSON.stringify(args || {})}`;
+function getToolCacheKey(toolName, args, token) {
+  const tokenHash = token ? hashString(token) : 0;
+  return `${toolName}:${tokenHash}:${JSON.stringify(args || {})}`;
+}
+
+function getAvailableToolsCacheKey(token) {
+  return `${MCP_URL}:${hashString(token || "")}:tools`;
+}
+
+function invalidateAvailableToolsCache(token) {
+  if (!availableToolsCache || !token) {
+    return;
+  }
+  availableToolsCache.delete(getAvailableToolsCacheKey(token));
+}
+
+async function getAvailableToolNames(token, options = {}) {
+  if (!token) {
+    return new Set();
+  }
+  const cacheKey = getAvailableToolsCacheKey(token);
+  if (!options.refresh && availableToolsCache) {
+    const cached = availableToolsCache.get(cacheKey);
+    if (cached) {
+      return cached;
+    }
+  }
+  const client = getMcpClient(token);
+  const tools = await client.listTools();
+  const names = new Set(
+    tools
+      .map((tool) => {
+        if (!tool) {
+          return "";
+        }
+        if (typeof tool === "string") {
+          return tool;
+        }
+        return tool.name || "";
+      })
+      .filter(Boolean)
+  );
+  if (availableToolsCache) {
+    availableToolsCache.set(cacheKey, names);
+  }
+  return names;
+}
+
+async function resolveKnownToolName(token, toolKey, options = {}) {
+  const definition = KNOWN_MCP_TOOLS[toolKey];
+  if (!definition) {
+    throw new Error(`未知工具定义：${toolKey}`);
+  }
+  const candidates = definition.names || [];
+  if (!candidates.length) {
+    throw new Error(`工具 ${toolKey} 未配置候选名。`);
+  }
+
+  try {
+    const available = await getAvailableToolNames(token, options);
+    if (available.size) {
+      for (const name of candidates) {
+        if (available.has(name)) {
+          return name;
+        }
+      }
+      throw new Error(`当前 MCP 服务未提供 ${definition.label} 工具，可用名：${candidates.join(" / ")}`);
+    }
+  } catch (error) {
+    if (options.requireDiscovery) {
+      throw error;
+    }
+  }
+
+  return candidates[0];
+}
+
+async function callKnownToolWithToken(token, toolKey, args) {
+  const toolName = await resolveKnownToolName(token, toolKey);
+  try {
+    return await callToolWithToken(token, toolName, args || {});
+  } catch (error) {
+    if (/unknown tool/i.test(getErrorMessage(error))) {
+      invalidateAvailableToolsCache(token);
+      const refreshedToolName = await resolveKnownToolName(token, toolKey, { refresh: true });
+      if (refreshedToolName !== toolName) {
+        return callToolWithToken(token, refreshedToolName, args || {});
+      }
+    }
+    throw error;
+  }
 }
 
 function buildMcpClient(token) {
@@ -1279,7 +2149,7 @@ async function callToolWithToken(token, toolName, args) {
     throw new Error("缺少 MCP Token，请先设置。");
   }
 
-  const cacheKey = getToolCacheKey(toolName, args);
+  const cacheKey = getToolCacheKey(toolName, args, token);
   const useCache = CACHEABLE_TOOLS.has(toolName);
   if (useCache) {
     const cached = cache.get(cacheKey);
@@ -1326,7 +2196,10 @@ async function validateToken(token) {
   const startedAt = Date.now();
   try {
     const client = getMcpClient(token);
-    await client.callTool("my-coupons", {});
+    const toolNames = await getAvailableToolNames(token, { refresh: true });
+    if (!toolNames.size) {
+      return { ok: false, authFailure: false, message: "未获取到可用工具列表。" };
+    }
     recordMcpSuccess(Date.now() - startedAt);
     return { ok: true };
   } catch (error) {
@@ -1363,34 +2236,15 @@ bot.catch((error, ctx) => {
 });
 
 bot.start((ctx) => {
-  const message = [
-    "欢迎使用麦麦 MCP 机器人。",
-    "",
-    TOKEN_GUIDE_MESSAGE,
-    "",
-    "在这里发送：",
-    "/token 你的MCP_TOKEN（首次会创建默认账号）",
-    "",
-    "指令：",
-    "/calendar [YYYY-MM-DD] - 活动日历查询",
-    "/coupons - 麦麦省可领取券列表",
-    "/claim - 麦麦省一键领券",
-    "/mycoupons - 我的优惠券",
-    "/autoclaim on|off [账号名] - 每日自动领券",
-    "/autoclaimreport success|fail on|off [账号名] - 自动领券结果汇报",
-    "/account add 名称 Token - 添加账号",
-    "/account use 名称 - 切换账号",
-    "/account list - 查看账号",
-    "/account del 名称 - 删除账号",
-    "/status - 查看账号状态",
-    "/stats - 我的领券统计",
-    "/cleartoken - 清空全部账号"
-  ].join("\n");
-  ctx.reply(message, { disable_web_page_preview: true, ...MAIN_MENU });
+  ctx.reply(buildQuickHelpMessage(), { disable_web_page_preview: true, ...MAIN_MENU });
 });
 
 bot.command("menu", (ctx) => {
   ctx.reply("请选择功能：", { disable_web_page_preview: true, ...MAIN_MENU });
+});
+
+bot.command(["help", "commands"], (ctx) => {
+  ctx.reply(buildHelpMessage(), { disable_web_page_preview: true });
 });
 
 function sendAccountHelp(ctx) {
@@ -1864,6 +2718,426 @@ async function sendTelegraphArticle(ctx, title, rawText, fallbackPrefix, cacheKe
   }
 }
 
+async function sendPlainToolText(ctx, text) {
+  await sendLongMessage(ctx, formatTelegramHtml(text || "未返回数据。"));
+}
+
+async function sendHtmlToolText(ctx, html) {
+  await sendLongMessage(ctx, html || "未返回数据。");
+}
+
+async function handleToolsList(ctx) {
+  const info = ensureAccount(ctx);
+  if (!info) return;
+
+  try {
+    const toolNames = await getAvailableToolNames(info.account.token, { refresh: true });
+    await sendPlainToolText(ctx, formatToolListMessage(toolNames));
+  } catch (error) {
+    ctx.reply(`工具列表查询失败：${formatMcpErrorMessage(error)}`);
+  }
+}
+
+async function handlePoints(ctx) {
+  const info = ensureAccount(ctx);
+  if (!info) return;
+
+  try {
+    const result = await callKnownToolWithToken(info.account.token, "myAccount", {});
+    await sendPlainToolText(ctx, formatPointsText(getStructuredToolData(result)));
+  } catch (error) {
+    ctx.reply(`积分查询失败：${formatMcpErrorMessage(error)}`);
+  }
+}
+
+async function handleNowTime(ctx) {
+  const info = ensureAccount(ctx);
+  if (!info) return;
+
+  try {
+    const result = await callKnownToolWithToken(info.account.token, "nowTimeInfo", {});
+    await sendPlainToolText(ctx, formatNowTimeText(getStructuredToolData(result)));
+  } catch (error) {
+    ctx.reply(`时间信息查询失败：${formatMcpErrorMessage(error)}`);
+  }
+}
+
+async function handleNutrition(ctx, keyword) {
+  const info = ensureAccount(ctx);
+  if (!info) return;
+
+  try {
+    const result = await callKnownToolWithToken(info.account.token, "nutritionFoods", {});
+    await sendPlainToolText(ctx, formatNutritionText(result, keyword));
+  } catch (error) {
+    ctx.reply(`营养信息查询失败：${formatMcpErrorMessage(error)}`);
+  }
+}
+
+async function handleMallCommand(ctx, payload) {
+  const info = ensureAccount(ctx);
+  if (!info) return;
+
+  const { head: subcommand, tail } = splitFirstToken(payload);
+  const sub = subcommand.toLowerCase();
+  if (!sub || sub === "list") {
+    try {
+      const result = await callKnownToolWithToken(info.account.token, "mallProducts", {});
+      await sendPlainToolText(ctx, formatMallProductsText(getStructuredToolData(result)));
+    } catch (error) {
+      ctx.reply(`积分商城列表查询失败：${formatMcpErrorMessage(error)}`);
+    }
+    return;
+  }
+
+  if (sub === "detail") {
+    if (!tail) {
+      ctx.reply("用法：/mall detail <spuId>");
+      return;
+    }
+    const spuId = Number(tail);
+    if (!Number.isFinite(spuId)) {
+      ctx.reply("spuId 必须是数字。");
+      return;
+    }
+    try {
+      const result = await callKnownToolWithToken(info.account.token, "mallProductDetail", { spuId });
+      await sendPlainToolText(ctx, formatMallProductDetailText(getStructuredToolData(result)));
+    } catch (error) {
+      ctx.reply(`积分商品详情查询失败：${formatMcpErrorMessage(error)}`);
+    }
+    return;
+  }
+
+  if (sub === "redeem") {
+    const args = tail.split(/\s+/).filter(Boolean);
+    const skuId = args[0];
+    const count = args[1] ? Number(args[1]) : 1;
+    if (!skuId) {
+      ctx.reply("用法：/mall redeem <skuId> [count]");
+      return;
+    }
+    if (!Number.isFinite(Number(skuId))) {
+      ctx.reply("skuId 必须是数字。");
+      return;
+    }
+    try {
+      const result = await callKnownToolWithToken(info.account.token, "mallCreateOrder", {
+        skuId: Number(skuId),
+        ...(Number.isFinite(count) && count > 0 ? { count } : {})
+      });
+      await sendPlainToolText(ctx, formatMallRedeemText(getStructuredToolData(result)));
+    } catch (error) {
+      ctx.reply(`积分兑换失败：${formatMcpErrorMessage(error)}`);
+    }
+    return;
+  }
+
+  ctx.reply("用法：/mall list | /mall detail <spuId> | /mall redeem <skuId> [count]");
+}
+
+async function handleDeliveryAddressesCommand(ctx, typeInput) {
+  const info = ensureAccount(ctx);
+  if (!info) return;
+
+  const parsedType = normalizeDeliveryTypeInput(typeInput);
+  if (!parsedType.ok) {
+    ctx.reply("用法：/deliveryaddrs mls|group");
+    return;
+  }
+
+  try {
+    const result = await callKnownToolWithToken(info.account.token, "deliveryAddresses", { beType: parsedType.value });
+    await sendPlainToolText(ctx, formatDeliveryAddressesText(getStructuredToolData(result), parsedType.label));
+  } catch (error) {
+    ctx.reply(`配送地址查询失败：${formatMcpErrorMessage(error)}`);
+  }
+}
+
+async function handleDeliveryAddCommand(ctx, payload) {
+  const info = ensureAccount(ctx);
+  if (!info) return;
+
+  const { head: typeInput, tail } = splitFirstToken(payload);
+  const parsedType = normalizeDeliveryTypeInput(typeInput);
+  if (!parsedType.ok) {
+    ctx.reply("用法：/deliveryadd mls|group 城市|联系人|电话|地址|门牌|性别(可选)");
+    return;
+  }
+  const fields = parsePipeFields(tail);
+  const [city, contactName, phone, address, addressDetail, gender] = fields;
+  if (!city || !contactName || !phone || !address || !addressDetail) {
+    ctx.reply("用法：/deliveryadd mls|group 城市|联系人|电话|地址|门牌|性别(可选)");
+    return;
+  }
+
+  try {
+    const result = await callKnownToolWithToken(info.account.token, "createDeliveryAddress", {
+      city,
+      contactName,
+      phone,
+      address,
+      addressDetail,
+      beType: parsedType.value,
+      ...(gender ? { gender } : {})
+    });
+    const data = getStructuredToolData(result);
+    const text = [
+      `${parsedType.label}地址创建成功：`,
+      `联系人: ${data && data.contactName ? data.contactName : contactName}`,
+      `电话: ${data && data.phone ? data.phone : phone}`,
+      `地址: ${data && data.fullAddress ? data.fullAddress : `${city} ${address} ${addressDetail}`}`,
+      `addressId: ${data && data.addressId ? data.addressId : "-"}`,
+      `门店: ${data && data.storeName ? `${data.storeName} (${data.storeCode || "-"})` : "-"}`,
+      `beCode: ${data && data.beCode ? data.beCode : "-"}`
+    ].join("\n");
+    await sendPlainToolText(ctx, text);
+  } catch (error) {
+    ctx.reply(`配送地址创建失败：${formatMcpErrorMessage(error)}`);
+  }
+}
+
+async function handleStoresCommand(ctx, payload) {
+  const info = ensureAccount(ctx);
+  if (!info) return;
+
+  const { head: subcommand, tail } = splitFirstToken(payload);
+  const sub = subcommand.toLowerCase();
+
+  if (!sub || sub === "fav" || sub === "favorite" || sub === "favorites") {
+    try {
+      const result = await callKnownToolWithToken(info.account.token, "nearbyStores", {
+        searchType: 1,
+        beType: 1
+      });
+      await sendPlainToolText(ctx, formatNearbyStoresText(getStructuredToolData(result)));
+    } catch (error) {
+      ctx.reply(`收藏门店查询失败：${formatMcpErrorMessage(error)}`);
+    }
+    return;
+  }
+
+  if (sub === "search") {
+    const { head: city, tail: keyword } = splitFirstToken(tail);
+    if (!city || !keyword) {
+      ctx.reply("用法：/stores search 城市 关键词");
+      return;
+    }
+    try {
+      const result = await callKnownToolWithToken(info.account.token, "nearbyStores", {
+        searchType: 2,
+        beType: 1,
+        city,
+        keyword
+      });
+      await sendPlainToolText(ctx, formatNearbyStoresText(getStructuredToolData(result)));
+    } catch (error) {
+      ctx.reply(`门店搜索失败：${formatMcpErrorMessage(error)}`);
+    }
+    return;
+  }
+
+  ctx.reply("用法：/stores fav | /stores search 城市 关键词");
+}
+
+async function handleStoreCouponsCommand(ctx, args) {
+  const info = ensureAccount(ctx);
+  if (!info) return;
+
+  const [storeCode, orderTypeInput, beCode] = args;
+  const parsed = buildStoreToolArgs(storeCode, orderTypeInput, beCode);
+  if (!parsed.ok) {
+    ctx.reply("用法：/storecoupons <storeCode> <pickup|delivery> [beCode]");
+    return;
+  }
+
+  try {
+    const result = await callKnownToolWithToken(info.account.token, "storeCoupons", parsed.value);
+    await sendPlainToolText(ctx, formatStoreCouponsText(getStructuredToolData(result)));
+  } catch (error) {
+    ctx.reply(`门店优惠券查询失败：${formatMcpErrorMessage(error)}`);
+  }
+}
+
+async function handleMealsCommand(ctx, args) {
+  const info = ensureAccount(ctx);
+  if (!info) return;
+
+  const [storeCode, orderTypeInput, beCode] = args;
+  const parsed = buildStoreToolArgs(storeCode, orderTypeInput, beCode);
+  if (!parsed.ok) {
+    ctx.reply("用法：/meals <storeCode> <pickup|delivery> [beCode]");
+    return;
+  }
+
+  try {
+    const result = await callKnownToolWithToken(info.account.token, "meals", parsed.value);
+    await sendPlainToolText(ctx, formatMealsText(getStructuredToolData(result)));
+  } catch (error) {
+    ctx.reply(`门店菜单查询失败：${formatMcpErrorMessage(error)}`);
+  }
+}
+
+async function handleMealDetailCommand(ctx, args) {
+  const info = ensureAccount(ctx);
+  if (!info) return;
+
+  const [code, storeCode, orderTypeInput, beCode] = args;
+  if (!code) {
+    ctx.reply("用法：/mealdetail <code> <storeCode> <pickup|delivery> [beCode]");
+    return;
+  }
+  const parsed = buildStoreToolArgs(storeCode, orderTypeInput, beCode);
+  if (!parsed.ok) {
+    ctx.reply("用法：/mealdetail <code> <storeCode> <pickup|delivery> [beCode]");
+    return;
+  }
+
+  try {
+    const result = await callKnownToolWithToken(info.account.token, "mealDetail", {
+      code,
+      ...parsed.value
+    });
+    await sendPlainToolText(ctx, formatMealDetailText(getStructuredToolData(result)));
+  } catch (error) {
+    ctx.reply(`餐品详情查询失败：${formatMcpErrorMessage(error)}`);
+  }
+}
+
+async function handlePriceCommand(ctx, payload) {
+  const info = ensureAccount(ctx);
+  if (!info) return;
+
+  const parsed = parseJsonPayload(
+    payload,
+    '用法：/price {"storeCode":"12345","orderType":"pickup","items":[{"productCode":"9900008139","quantity":1}]}'
+  );
+  if (!parsed.ok) {
+    ctx.reply(parsed.message);
+    return;
+  }
+  const args = { ...parsed.value };
+  if (args.orderType !== undefined) {
+    const orderType = normalizeOrderTypeInput(args.orderType);
+    if (!orderType.ok) {
+      ctx.reply(orderType.message);
+      return;
+    }
+    args.orderType = orderType.value;
+  }
+  if (!Array.isArray(args.items) || !args.items.length) {
+    ctx.reply("price 参数中的 items 必须是非空数组。");
+    return;
+  }
+  if (args.orderType === 2 && !args.beCode) {
+    ctx.reply("外送价格计算必须提供 beCode。");
+    return;
+  }
+  if (args.orderType === 1) {
+    delete args.beCode;
+  }
+
+  try {
+    const result = await callKnownToolWithToken(info.account.token, "calculatePrice", args);
+    await sendPlainToolText(ctx, formatPriceResultText(getStructuredToolData(result)));
+  } catch (error) {
+    ctx.reply(`价格计算失败：${formatMcpErrorMessage(error)}`);
+  }
+}
+
+async function handleOrderCommand(ctx, payload) {
+  const info = ensureAccount(ctx);
+  if (!info) return;
+
+  const { head: subcommand, tail } = splitFirstToken(payload);
+  const sub = subcommand.toLowerCase();
+  if (sub === "query") {
+    if (!tail) {
+      ctx.reply("用法：/order query <orderId>");
+      return;
+    }
+    try {
+      const result = await callKnownToolWithToken(info.account.token, "queryOrder", { orderId: tail });
+      await sendPlainToolText(ctx, formatOrderText(getStructuredToolData(result), { title: "订单详情：" }));
+    } catch (error) {
+      ctx.reply(`订单查询失败：${formatMcpErrorMessage(error)}`);
+    }
+    return;
+  }
+
+  if (sub === "create") {
+    const parsed = parseJsonPayload(
+      tail,
+      '用法：/order create {"storeCode":"12345","orderType":"pickup","takeWayCode":"locker-in","items":[{"productCode":"9900008139","quantity":1}]}'
+    );
+    if (!parsed.ok) {
+      ctx.reply(parsed.message);
+      return;
+    }
+    const args = { ...parsed.value };
+    if (args.orderType !== undefined) {
+      const orderType = normalizeOrderTypeInput(args.orderType);
+      if (!orderType.ok) {
+        ctx.reply(orderType.message);
+        return;
+      }
+      args.orderType = orderType.value;
+    }
+    if (!Array.isArray(args.items) || !args.items.length) {
+      ctx.reply("order create 参数中的 items 必须是非空数组。");
+      return;
+    }
+    if (args.orderType === 2 && !args.beCode) {
+      ctx.reply("外送下单必须提供 beCode。");
+      return;
+    }
+    if (args.orderType === 1) {
+      delete args.beCode;
+    }
+
+    try {
+      const result = await callKnownToolWithToken(info.account.token, "createOrder", args);
+      await sendPlainToolText(
+        ctx,
+        formatOrderText(getStructuredToolData(result), { title: "下单结果：", includeNestedDetail: true })
+      );
+    } catch (error) {
+      ctx.reply(`创建订单失败：${formatMcpErrorMessage(error)}`);
+    }
+    return;
+  }
+
+  ctx.reply("用法：/order create <json> | /order query <orderId>");
+}
+
+async function handleRawToolCommand(ctx, payload) {
+  const info = ensureAccount(ctx);
+  if (!info) return;
+
+  const { head: toolName, tail } = splitFirstToken(payload);
+  if (!toolName) {
+    ctx.reply('用法：/tool <toolName> [json]\n例如：/tool now-time-info\n/tool query-order {"orderId":"123"}');
+    return;
+  }
+
+  let args = {};
+  if (tail) {
+    const parsed = parseJsonPayload(tail, "tool 的第二段参数必须是 JSON 对象。");
+    if (!parsed.ok) {
+      ctx.reply(parsed.message);
+      return;
+    }
+    args = parsed.value;
+  }
+
+  try {
+    const result = await callToolWithToken(info.account.token, toolName, args);
+    await sendHtmlToolText(ctx, formatGenericToolResponse(result));
+  } catch (error) {
+    ctx.reply(`工具调用失败：${formatMcpErrorMessage(error)}`);
+  }
+}
+
 async function handleCalendar(ctx, specifiedDate) {
   const info = ensureAccount(ctx);
   if (!info) return;
@@ -1878,11 +3152,12 @@ async function handleCalendar(ctx, specifiedDate) {
   }
 
   try {
-    const result = await callToolWithToken(info.account.token, "campaign-calender", args);
+    const result = await callKnownToolWithToken(info.account.token, "calendar", args);
     const rawText = getToolRawText(result);
     const cleaned = normalizeCalendarText(rawText);
     const title = specifiedDate ? `麦当劳活动日历（${specifiedDate}）` : "麦当劳活动日历";
-    const cacheKey = getToolCacheKey("campaign-calender", args);
+    const toolName = await resolveKnownToolName(info.account.token, "calendar");
+    const cacheKey = getToolCacheKey(toolName, args, info.account.token);
     await sendTelegraphArticle(ctx, title, cleaned, "活动日历", cacheKey);
   } catch (error) {
     ctx.reply(`活动日历查询失败：${formatMcpErrorMessage(error)}`);
@@ -1894,10 +3169,11 @@ async function handleAvailableCoupons(ctx) {
   if (!info) return;
 
   try {
-    const result = await callToolWithToken(info.account.token, "available-coupons", {});
+    const result = await callKnownToolWithToken(info.account.token, "availableCoupons", {});
     const rawText = getToolRawText(result);
     const cleaned = normalizeCouponListText(rawText);
-    const cacheKey = getToolCacheKey("available-coupons", {});
+    const toolName = await resolveKnownToolName(info.account.token, "availableCoupons");
+    const cacheKey = getToolCacheKey(toolName, {}, info.account.token);
     await sendTelegraphArticle(ctx, "麦麦省优惠券列表", cleaned, "优惠券列表", cacheKey);
   } catch (error) {
     ctx.reply(`优惠券列表查询失败：${formatMcpErrorMessage(error)}`);
@@ -1909,7 +3185,7 @@ async function handleClaimCoupons(ctx) {
   if (!info) return;
 
   try {
-    const result = await callToolWithToken(info.account.token, "auto-bind-coupons", {});
+    const result = await callKnownToolWithToken(info.account.token, "claimCoupons", {});
     const rawText = getToolRawText(result);
     const normalized = normalizeToolText(rawText);
     const simplified = simplifyClaimResultText(normalized);
@@ -1933,7 +3209,7 @@ async function runImmediateAutoClaim(ctx, info) {
   const today = getLocalDate(AUTO_CLAIM_TIMEZONE);
 
   try {
-    const result = await callToolWithToken(info.account.token, "auto-bind-coupons", {});
+    const result = await callKnownToolWithToken(info.account.token, "claimCoupons", {});
     const rawText = getToolRawText(result);
     const normalized = normalizeToolText(rawText);
     const simplified = simplifyClaimResultText(normalized);
@@ -1978,7 +3254,7 @@ async function handleMyCoupons(ctx) {
   if (!info) return;
 
   try {
-    const result = await callToolWithToken(info.account.token, "my-coupons", {});
+    const result = await callKnownToolWithToken(info.account.token, "myCoupons", {});
     const rawText = getToolRawText(result);
     const normalized = normalizeMyCouponsText(rawText);
     const text = formatTelegramHtml(stripImagesFromText(normalized));
@@ -2036,6 +3312,63 @@ bot.command("claim", async (ctx) => {
 
 bot.command("mycoupons", async (ctx) => {
   await handleMyCoupons(ctx);
+});
+
+bot.command("tools", async (ctx) => {
+  await handleToolsList(ctx);
+});
+
+bot.command("points", async (ctx) => {
+  await handlePoints(ctx);
+});
+
+bot.command(["now", "timeinfo"], async (ctx) => {
+  await handleNowTime(ctx);
+});
+
+bot.command("nutrition", async (ctx) => {
+  await handleNutrition(ctx, getCommandPayload(ctx));
+});
+
+bot.command("mall", async (ctx) => {
+  await handleMallCommand(ctx, getCommandPayload(ctx));
+});
+
+bot.command("deliveryaddrs", async (ctx) => {
+  const args = parseCommandArgs(ctx);
+  await handleDeliveryAddressesCommand(ctx, args[0] || "");
+});
+
+bot.command("deliveryadd", async (ctx) => {
+  await handleDeliveryAddCommand(ctx, getCommandPayload(ctx));
+});
+
+bot.command("stores", async (ctx) => {
+  await handleStoresCommand(ctx, getCommandPayload(ctx));
+});
+
+bot.command("storecoupons", async (ctx) => {
+  await handleStoreCouponsCommand(ctx, parseCommandArgs(ctx));
+});
+
+bot.command("meals", async (ctx) => {
+  await handleMealsCommand(ctx, parseCommandArgs(ctx));
+});
+
+bot.command("mealdetail", async (ctx) => {
+  await handleMealDetailCommand(ctx, parseCommandArgs(ctx));
+});
+
+bot.command("price", async (ctx) => {
+  await handlePriceCommand(ctx, getCommandPayload(ctx));
+});
+
+bot.command("order", async (ctx) => {
+  await handleOrderCommand(ctx, getCommandPayload(ctx));
+});
+
+bot.command("tool", async (ctx) => {
+  await handleRawToolCommand(ctx, getCommandPayload(ctx));
 });
 
 bot.command("autoclaim", (ctx) => {
@@ -2111,6 +3444,16 @@ bot.action("menu_mycoupons", async (ctx) => {
   await handleMyCoupons(ctx);
 });
 
+bot.action("menu_points", async (ctx) => {
+  await ctx.answerCbQuery();
+  await handlePoints(ctx);
+});
+
+bot.action("menu_now", async (ctx) => {
+  await ctx.answerCbQuery();
+  await handleNowTime(ctx);
+});
+
 bot.action("menu_status", async (ctx) => {
   await ctx.answerCbQuery();
   sendStatus(ctx);
@@ -2156,9 +3499,19 @@ bot.action("menu_accounts", async (ctx) => {
   sendAccountHelp(ctx);
 });
 
+bot.action("menu_help", async (ctx) => {
+  await ctx.answerCbQuery();
+  ctx.reply(buildHelpMessage(), { disable_web_page_preview: true });
+});
+
 bot.action("menu_token_help", async (ctx) => {
   await ctx.answerCbQuery();
   sendTokenGuide(ctx);
+});
+
+bot.action("menu_more", async (ctx) => {
+  await ctx.answerCbQuery();
+  ctx.reply(buildAdvancedFeatureMessage(), { disable_web_page_preview: true });
 });
 
 const autoClaimInProgress = new Set();
@@ -2473,7 +3826,7 @@ async function runAutoClaimSweep() {
       updateGlobalState({ lastAutoClaimRequestAt: requestAt });
 
       try {
-        const result = await callToolWithToken(task.account.token, "auto-bind-coupons", {});
+        const result = await callKnownToolWithToken(task.account.token, "claimCoupons", {});
         const rawText = getToolRawText(result);
         const normalized = normalizeToolText(rawText);
         const simplified = simplifyClaimResultText(normalized);
@@ -2631,6 +3984,26 @@ function startSweepWatchdog() {
   watchdogInterval = setInterval(check, SWEEP_WATCHDOG_SECONDS * 1000);
 }
 
+function shutdown(signal) {
+  if (autoClaimInterval) {
+    clearInterval(autoClaimInterval);
+    autoClaimInterval = null;
+  }
+  if (burstInterval) {
+    clearInterval(burstInterval);
+    burstInterval = null;
+  }
+  if (watchdogInterval) {
+    clearInterval(watchdogInterval);
+    watchdogInterval = null;
+  }
+  if (mcpHealthInterval) {
+    clearInterval(mcpHealthInterval);
+    mcpHealthInterval = null;
+  }
+  bot.stop(signal);
+}
+
 startMcpHealthMonitor();
 startAutoClaimScheduler();
 startSweepWatchdog();
@@ -2660,26 +4033,6 @@ bot.launch()
     console.error("Bot failed to start.", error);
     process.exit(1);
   });
-
-function shutdown(signal) {
-  if (autoClaimInterval) {
-    clearInterval(autoClaimInterval);
-    autoClaimInterval = null;
-  }
-  if (burstInterval) {
-    clearInterval(burstInterval);
-    burstInterval = null;
-  }
-  if (watchdogInterval) {
-    clearInterval(watchdogInterval);
-    watchdogInterval = null;
-  }
-  if (mcpHealthInterval) {
-    clearInterval(mcpHealthInterval);
-    mcpHealthInterval = null;
-  }
-  bot.stop(signal);
-}
 
 process.once("SIGINT", () => shutdown("SIGINT"));
 process.once("SIGTERM", () => shutdown("SIGTERM"));

@@ -22,6 +22,14 @@ class TTLCache {
       expiresAt: Date.now() + this.ttlMs
     });
   }
+
+  delete(key) {
+    this.store.delete(key);
+  }
+
+  clear() {
+    this.store.clear();
+  }
 }
 
 module.exports = {

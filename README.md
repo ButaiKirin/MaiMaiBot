@@ -1,16 +1,37 @@
 # MaiMai Telegram Bot
 
-A Telegram bot that calls the McDonald's MCP tools (campaign calendar and coupons) via Streamable HTTP.
+A Telegram bot for McDonald's China MCP tools over Streamable HTTP.
+
+## Current Interface Support
+
+This project is aligned with the current official MCP documentation at [https://open.mcd.cn/mcp/doc](https://open.mcd.cn/mcp/doc), including the `2026-04-02` `v1.0.3` toolset.
+
+It now handles the current interface changes:
+
+- Uses the current canonical MCP URL `https://mcp.mcd.cn`
+- Validates tokens through `tools/list` instead of hard-coding a single tool call
+- Adapts to renamed tools:
+  - `campaign-calender` -> `campaign-calendar`
+  - `my-coupons` -> `query-my-coupons`
+- Keeps compatibility with legacy tool names where possible
+- Isolates cache entries by token to avoid cross-account result reuse
 
 ## Features
 
-- Campaign calendar query (`campaign-calender`) via Telegraph article (with images)
-- Available coupons list (`available-coupons`) via Telegraph article (with images)
-- One-click claim all coupons (`auto-bind-coupons`)
-- My coupons list (`my-coupons`)
-- Optional 5-minute cache for non-user-specific tools
-- Daily auto-claim (once per day) with burst scheduling when new coupons appear
-- Multiple MCP accounts per Telegram user (switchable)
+- Campaign calendar query via Telegraph article with images
+- Available coupons list
+- One-click claim all available coupons
+- My coupons list
+- My points query
+- Nutrition list query with keyword filtering
+- Points mall product list, detail, and redeem
+- Delivery address list and create
+- Nearby store search and favorite-store query
+- Store coupon, meal list, meal detail, price calculation, order create/query
+- Raw `/tool` passthrough for any currently exposed MCP tool
+- Optional cache for selected tools
+- Daily auto-claim with burst scheduling when new coupons appear
+- Multiple MCP accounts per Telegram user
 
 ## Requirements
 
@@ -35,29 +56,74 @@ npm start
 
 ## Bot Commands
 
-- `/token YOUR_MCP_TOKEN` - save your MCP token
+- `/help` - full command list
+- `/tools` - list MCP tools available to the active account
+
+Account and token:
+
+- `/token YOUR_MCP_TOKEN` - save MCP token to the active/default account
 - `/account add <name> <token>` - add/update an account
 - `/account use <name>` - switch active account
 - `/account list` - list accounts
 - `/account del <name>` - delete an account
-- `/calendar [YYYY-MM-DD]` - campaign calendar (optional date)
+- `/cleartoken` - clear all accounts
+- `/status` - show account status
+- `/stats` - my claim stats
+
+Coupon and calendar:
+
+- `/calendar [YYYY-MM-DD]` - campaign calendar
 - `/coupons` - available coupons
 - `/claim` - one-click claim all available coupons
 - `/mycoupons` - my coupons list
 - `/autoclaim on|off [name]` - enable/disable daily auto-claim per account
 - `/autoclaimreport success|fail on|off [name]` - enable/disable auto-claim reporting per account
-- `/status` - show account status
-- `/stats` - my claim stats
-- `/cleartoken` - clear all accounts
+
+Points, mall, time, nutrition:
+
+- `/points` - my points account
+- `/mall list` - points mall product list
+- `/mall detail <spuId>` - points mall product detail
+- `/mall redeem <skuId> [count]` - redeem a points mall item
+- `/nutrition [keyword]` - nutrition list (optional local keyword filter)
+- `/now` - MCP server current time info
+
+Store and delivery:
+
+- `/deliveryaddrs mls|group` - list delivery addresses
+- `/deliveryadd mls|group 城市|联系人|电话|地址|门牌|性别(可选)` - create a delivery address
+- `/stores fav` - query favorite in-store pickup stores
+- `/stores search <city> <keyword>` - search nearby stores
+- `/storecoupons <storeCode> <pickup|delivery> [beCode]` - list usable coupons for a store/order type
+- `/meals <storeCode> <pickup|delivery> [beCode]` - list meals for a store/order type
+- `/mealdetail <code> <storeCode> <pickup|delivery> [beCode]` - meal detail
+
+Advanced order tools:
+
+- `/price <json>` - call `calculate-price`
+- `/order create <json>` - call `create-order`
+- `/order query <orderId>` - call `query-order`
+- `/tool <toolName> [json]` - raw passthrough for any current MCP tool
+
+Admin:
+
 - `/admin` - admin summary (users/accounts/auto-claim status/claim totals/config/sweep状态)
 - `/admin notify on|off` - admin error push toggle
 - `/admin sweep` - run a sweep immediately (admin)
+
+### JSON command examples
+
+```bash
+/price {"storeCode":"12345","orderType":"pickup","items":[{"productCode":"9900008139","quantity":1}]}
+/order create {"storeCode":"12345","orderType":"pickup","takeWayCode":"locker-in","items":[{"productCode":"9900008139","quantity":1}]}
+/tool now-time-info
+```
 
 ## Environment Variables
 
 See `.env.example` for all options. Key variables:
 
-- `MCD_MCP_URL` (default: `https://mcp.mcd.cn/mcp-servers/mcd-mcp`)
+- `MCD_MCP_URL` (default: `https://mcp.mcd.cn`)
 - `MCP_REQUEST_TIMEOUT_MS` (default: `30000`)
 - `MCP_CLIENT_CACHE_TTL_SECONDS` (default: `1800`)
 - `MCP_RETRY_MAX` (default: `2`)
@@ -78,7 +144,7 @@ See `.env.example` for all options. Key variables:
 - `TOKEN_SET_RATE_LIMIT_MS` (default: `30000`)
 - `ACCOUNT_SET_RATE_LIMIT_MS` (default: `30000`)
 - `CACHE_TTL_SECONDS` (default: `300`)
-- `CACHEABLE_TOOLS` (default: `campaign-calender,available-coupons`)
+- `CACHEABLE_TOOLS` (default: `campaign-calendar,list-nutrition-foods`)
 - `AUTO_CLAIM_CHECK_MINUTES` (default: `10`)
 - `AUTO_CLAIM_HOUR` (default: `9`)
 - `AUTO_CLAIM_TIMEZONE` (default: `Asia/Shanghai`)
@@ -97,6 +163,7 @@ See `.env.example` for all options. Key variables:
 
 - The bot uses MCP Streamable HTTP (protocol 2025-06-18).
 - The MCP token is required for all tool calls.
+- Official docs: [https://open.mcd.cn/mcp/doc](https://open.mcd.cn/mcp/doc)
 - Telegraph access token is created automatically and stored at `data/telegraph.json`.
 - Auto-claim runs once per account per day, scheduled across a spread window to avoid bursts.
 - When any account claims a previously unseen coupon, the bot triggers a short burst window so all accounts attempt to claim within that time.

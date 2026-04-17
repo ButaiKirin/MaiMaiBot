@@ -146,6 +146,47 @@ class MCPClient {
     }
   }
 
+  async listTools() {
+    await this.initialize();
+    const tools = [];
+    let cursor = undefined;
+
+    while (true) {
+      const message = {
+        jsonrpc: "2.0",
+        id: this._nextId(),
+        method: "tools/list",
+        params: cursor ? { cursor } : {}
+      };
+
+      let response;
+      try {
+        response = await this._sendRpc(message, { expectResponse: true });
+      } catch (error) {
+        if (error && error.code === "MCP_SESSION_EXPIRED") {
+          this.initialized = false;
+          this.sessionId = null;
+          await this.initialize();
+          response = await this._sendRpc(message, { expectResponse: true });
+        } else {
+          throw error;
+        }
+      }
+
+      const result = this._unwrapResult(response) || {};
+      const pageTools = Array.isArray(result.tools) ? result.tools : Array.isArray(result) ? result : [];
+      if (pageTools.length) {
+        tools.push(...pageTools);
+      }
+      if (!result.nextCursor) {
+        break;
+      }
+      cursor = result.nextCursor;
+    }
+
+    return tools;
+  }
+
   async initialize() {
     if (this.initialized) {
       return;
