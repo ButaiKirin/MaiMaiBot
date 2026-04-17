@@ -154,7 +154,19 @@ let autoClaimInterval = null;
 let burstInterval = null;
 let watchdogInterval = null;
 let mcpHealthInterval = null;
+let syntheticUpdateId = 900000000;
+let syntheticMessageId = 900000000;
 const userRateLimits = new Map();
+
+function nextSyntheticUpdateId() {
+  syntheticUpdateId += 1;
+  return syntheticUpdateId;
+}
+
+function nextSyntheticMessageId() {
+  syntheticMessageId += 1;
+  return syntheticMessageId;
+}
 
 const ACCOUNT_ID_PATTERN = /^[A-Za-z0-9._\-\u4e00-\u9fff]+$/;
 const TOKEN_PATTERN = /^[A-Za-z0-9._=-]+$/;
@@ -2649,7 +2661,7 @@ bot.command("admin", (ctx) => {
   }
 
   if (sub === "sweep" || sub === "run") {
-    runAutoClaimSweep()
+    runAutoClaimSweep({ forceAll: true })
       .then(() => {
         const state = getGlobalState();
         ctx.reply(
@@ -3681,25 +3693,28 @@ function ensureBurstScheduler(enabled) {
   }, GLOBAL_BURST_CHECK_SECONDS * 1000);
 }
 
-async function runAutoClaimSweep() {
+async function runAutoClaimSweep(options = {}) {
   if (autoClaimSweepInProgress) {
     logAutoClaimDebug("Sweep skipped: already in progress.");
     return;
   }
   autoClaimSweepInProgress = true;
+  const forceAll = Boolean(options && options.forceAll);
 
   const sweepStartedAt = Date.now();
   let sweepEligible = 0;
   let sweepProcessed = 0;
-  let sweepReason = "daily";
+  let sweepReason = forceAll ? "manual" : "daily";
   let sweepError = "";
 
   try {
     const users = allUsers();
     const nowMs = Date.now();
     const burst = getActiveBurst();
-    ensureBurstScheduler(Boolean(burst));
-    sweepReason = burst ? "burst" : "daily";
+    ensureBurstScheduler(!forceAll && Boolean(burst));
+    if (!forceAll) {
+      sweepReason = burst ? "burst" : "daily";
+    }
     const today = getLocalDate(AUTO_CLAIM_TIMEZONE);
     const nowMinutes = getMinutesSinceMidnight(AUTO_CLAIM_TIMEZONE);
     if (!Number.isFinite(nowMinutes)) {
@@ -3739,7 +3754,9 @@ async function runAutoClaimSweep() {
         let targetMinute = null;
         let targetAt = null;
 
-        if (burst) {
+        if (forceAll) {
+          // Manual sweep ignores schedule windows and per-account due time.
+        } else if (burst) {
           if (account.lastBurstId === burst.id) {
             skipStats.burstAlreadyRan += 1;
             continue;
@@ -3780,7 +3797,7 @@ async function runAutoClaimSweep() {
           accountId,
           account,
           displayName,
-          reason: burst ? "burst" : "daily",
+          reason: forceAll ? "manual" : burst ? "burst" : "daily",
           targetMinute,
           targetAt
         });
@@ -3795,13 +3812,17 @@ async function runAutoClaimSweep() {
       return;
     }
 
-    if (burst) {
+    if (burst && !forceAll) {
       tasks.sort((a, b) => (a.targetAt || 0) - (b.targetAt || 0));
     } else {
       tasks.sort((a, b) => (a.targetMinute || 0) - (b.targetMinute || 0));
     }
 
-    const maxPerSweep = AUTO_CLAIM_MAX_PER_SWEEP > 0 ? AUTO_CLAIM_MAX_PER_SWEEP : tasks.length;
+    const maxPerSweep = forceAll
+      ? tasks.length
+      : AUTO_CLAIM_MAX_PER_SWEEP > 0
+        ? AUTO_CLAIM_MAX_PER_SWEEP
+        : tasks.length;
     let remaining = maxPerSweep;
     let nextAllowedAt = getGlobalState().lastAutoClaimRequestAt || 0;
 
@@ -4004,35 +4025,439 @@ function shutdown(signal) {
   bot.stop(signal);
 }
 
-startMcpHealthMonitor();
-startAutoClaimScheduler();
-startSweepWatchdog();
+function getSyntheticCommandEntities(text) {
+  const source = String(text || "");
+  const match = source.match(/^\/\S+/);
+  if (!match) {
+    return [];
+  }
+  return [
+    {
+      offset: 0,
+      length: match[0].length,
+      type: "bot_command"
+    }
+  ];
+}
 
-bot.launch()
-  .then(() => {
-    console.log("Bot started.");
-    bot.telegram.setMyCommands([
-      { command: "menu", description: "打开按钮菜单" },
-      { command: "token", description: "设置 MCP Token（默认账号）" },
-      { command: "account", description: "账号管理" },
-      { command: "calendar", description: "活动日历查询" },
-      { command: "coupons", description: "可领优惠券列表" },
-      { command: "claim", description: "一键领券" },
-      { command: "mycoupons", description: "我的优惠券" },
-      { command: "autoclaim", description: "每日自动领券开关" },
-      { command: "autoclaimreport", description: "自动领券汇报开关(成/败)" },
-      { command: "status", description: "查看账号状态" },
-      { command: "stats", description: "查看我的领券统计" },
-      { command: "cleartoken", description: "清空全部账号" },
-      { command: "admin", description: "管理员统计" }
-    ]).catch((error) => {
-      console.error("Failed to set bot commands", error);
-    });
-  })
-  .catch((error) => {
-    console.error("Bot failed to start.", error);
-    process.exit(1);
+function createSyntheticMessageUpdate(userId, text, options = {}) {
+  const numericUserId = Number(userId);
+  const chatId = options.chatId !== undefined ? Number(options.chatId) : numericUserId;
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const firstName = options.firstName || "Synthetic";
+  const username = options.username || "synthetic_runner";
+  const message = {
+    message_id: nextSyntheticMessageId(),
+    date: nowSeconds,
+    chat: {
+      id: chatId,
+      type: "private",
+      first_name: firstName,
+      username
+    },
+    from: {
+      id: numericUserId,
+      is_bot: false,
+      first_name: firstName,
+      username,
+      language_code: "zh-hans"
+    },
+    text: String(text || "")
+  };
+  const entities = getSyntheticCommandEntities(text);
+  if (entities.length) {
+    message.entities = entities;
+  }
+  return {
+    update_id: nextSyntheticUpdateId(),
+    message
+  };
+}
+
+function createSyntheticCommandContext(userId, text, options = {}) {
+  const update = createSyntheticMessageUpdate(userId, text, options);
+  const chatId = update.message.chat.id;
+  return {
+    update,
+    from: update.message.from,
+    chat: update.message.chat,
+    message: update.message,
+    reply(replyText, extra = {}) {
+      return bot.telegram.sendMessage(chatId, replyText, extra);
+    },
+    replyWithHTML(replyText, extra = {}) {
+      return bot.telegram.sendMessage(chatId, replyText, { ...extra, parse_mode: "HTML" });
+    }
+  };
+}
+
+function parseSyntheticCommandText(text) {
+  const source = String(text || "").trim();
+  if (!source.startsWith("/")) {
+    return { command: "", payload: "" };
+  }
+  const withoutSlash = source.slice(1);
+  const spaceIndex = withoutSlash.indexOf(" ");
+  const commandPart = spaceIndex >= 0 ? withoutSlash.slice(0, spaceIndex) : withoutSlash;
+  const payload = spaceIndex >= 0 ? withoutSlash.slice(spaceIndex + 1).trim() : "";
+  return {
+    command: commandPart.split("@")[0].toLowerCase(),
+    payload
+  };
+}
+
+async function dispatchSyntheticCommand(ctx) {
+  const { command, payload } = parseSyntheticCommandText(ctx.message && ctx.message.text);
+  switch (command) {
+    case "start":
+      ctx.reply(buildQuickHelpMessage(), { disable_web_page_preview: true, ...MAIN_MENU });
+      return;
+    case "menu":
+      ctx.reply("请选择功能：", { disable_web_page_preview: true, ...MAIN_MENU });
+      return;
+    case "help":
+    case "commands":
+      ctx.reply(buildHelpMessage(), { disable_web_page_preview: true });
+      return;
+    case "token":
+    case "settoken": {
+      const args = parseCommandArgs(ctx);
+      const sub = args[0] ? args[0].toLowerCase() : "";
+      if (["add", "use", "list", "del", "delete", "rm", "help"].includes(sub)) {
+        await handleAccountCommand(ctx, args);
+      } else {
+        const token = args.join(" ").trim();
+        if (!token) {
+          ctx.reply("用法：/token 你的MCP_TOKEN");
+          return;
+        }
+
+        const userId = String(ctx.from.id);
+        const limit = checkRateLimit(userId, "token_set", TOKEN_SET_RATE_LIMIT_MS);
+        if (!limit.ok) {
+          ctx.reply(`操作过于频繁，请 ${Math.ceil(limit.waitMs / 1000)} 秒后再试。`);
+          return;
+        }
+        const tokenCheck = validateTokenInput(token);
+        if (!tokenCheck.ok) {
+          ctx.reply(tokenCheck.message);
+          return;
+        }
+        const user = getUser(userId);
+        const accountId = user && user.activeAccountId ? user.activeAccountId : "default";
+        const validation = await validateToken(tokenCheck.value);
+        if (!validation.ok && validation.authFailure) {
+          ctx.reply("Token 无效或已失效，请重新获取。");
+          return;
+        }
+        const result = addOrUpdateAccount(
+          userId,
+          accountId,
+          tokenCheck.value,
+          accountId === "default" ? "默认账号" : accountId
+        );
+        const { existed, isNewAccount } = result;
+        if (!validation.ok) {
+          ctx.reply(`${existed ? "Token 已更新" : "Token 已保存"}，但暂时无法验证：${validation.message}`);
+          return;
+        }
+        ctx.reply(existed ? "Token 已更新，可以继续使用。" : "Token 已保存，可以开始使用指令了。");
+        if (isNewAccount) {
+          const info = getAccountInfo(userId, accountId);
+          if (info && info.account.autoClaimEnabled) {
+            runImmediateAutoClaim(ctx, info).catch((error) => {
+              console.error("Immediate auto-claim failed", error);
+            });
+          }
+        }
+      }
+      return;
+    }
+    case "account":
+    case "accounts":
+      await handleAccountCommand(ctx, parseCommandArgs(ctx));
+      return;
+    case "cleartoken":
+      {
+        const userId = String(ctx.from.id);
+        const existing = getUser(userId);
+        if (!existing) {
+          ctx.reply("未找到已保存的账号。");
+          return;
+        }
+        deleteUser(userId);
+        ctx.reply("已清空全部账号。");
+      }
+      return;
+    case "status":
+      sendStatus(ctx);
+      return;
+    case "stats":
+      sendStats(ctx);
+      return;
+    case "admin": {
+      if (!ensureAdmin(ctx)) {
+        return;
+      }
+      const args = parseCommandArgs(ctx);
+      const sub = args[0] ? args[0].toLowerCase() : "";
+      if (sub === "notify" || sub === "push" || sub === "alert") {
+        const setting = args[1] ? args[1].toLowerCase() : "";
+        if (setting !== "on" && setting !== "off") {
+          ctx.reply("用法：/admin notify on|off");
+          return;
+        }
+        const enabled = setting === "on";
+        updateAdminSettings({ errorPushEnabled: enabled });
+        ctx.reply(`管理员报错推送已${enabled ? "开启" : "关闭"}。`);
+        return;
+      }
+      if (sub === "sweep" || sub === "run") {
+        runAutoClaimSweep({ forceAll: true })
+          .then(() => {
+            const state = getGlobalState();
+            ctx.reply(
+              [
+                "手动触发 Sweep 完成：",
+                `开始：${formatTimestamp(state.lastSweepStartedAt, AUTO_CLAIM_TIMEZONE)}`,
+                `结束：${formatTimestamp(state.lastSweepFinishedAt, AUTO_CLAIM_TIMEZONE)}`,
+                `耗时：${state.lastSweepDurationMs ? `${Math.round(state.lastSweepDurationMs / 1000)}秒` : "无"}`,
+                `原因：${state.lastSweepReason || "无"}`,
+                `符合：${state.lastSweepEligible || 0}`,
+                `已处理：${state.lastSweepProcessed || 0}`,
+                `错误：${state.lastSweepError || "无"}`
+              ].join("\n")
+            );
+          })
+          .catch((error) => {
+            ctx.reply(`手动 Sweep 失败：${sanitizeInlineText(getErrorMessage(error), { maxLength: 400 })}`);
+          });
+        return;
+      }
+      const today = getLocalDate(AUTO_CLAIM_TIMEZONE);
+      const metrics = computeAdminMetrics(today);
+      const baseline = getAdminSummaryBaseline(today, metrics);
+      const totalFailure = metrics.todayAutoClaimFailureAuth + metrics.todayAutoClaimFailureOther;
+      const baselineFailure =
+        (Number(baseline.todayAutoClaimFailureAuth) || 0) + (Number(baseline.todayAutoClaimFailureOther) || 0);
+      const state = getGlobalState();
+      const lastRequestAt = formatTimestamp(state.lastAutoClaimRequestAt, AUTO_CLAIM_TIMEZONE);
+      const lastSweepStartedAt = formatTimestamp(state.lastSweepStartedAt, AUTO_CLAIM_TIMEZONE);
+      const lastSweepFinishedAt = formatTimestamp(state.lastSweepFinishedAt, AUTO_CLAIM_TIMEZONE);
+      const lastSweepDuration = state.lastSweepDurationMs ? `${Math.round(state.lastSweepDurationMs / 1000)}秒` : "无";
+      const lastSweepProcessed = Number(state.lastSweepProcessed) || 0;
+      const lastSweepEligible = Number(state.lastSweepEligible) || 0;
+      const lastSweepReason = state.lastSweepReason || "无";
+      const lastSweepError = state.lastSweepError || "无";
+      const burst = getActiveBurst();
+      const burstRemainingMs = burst ? Math.max(0, burst.endAt - Date.now()) : 0;
+      const burstRemainingMinutes = burst ? Math.ceil(burstRemainingMs / 60000) : 0;
+      const burstTriggeredAt = burst ? formatTimestamp(burst.startAt, AUTO_CLAIM_TIMEZONE) : "无";
+      const burstCouponCount = burst && Array.isArray(burst.couponIds) ? burst.couponIds.length : 0;
+      const burstStatus = burst
+        ? `进行中（剩余约 ${burstRemainingMinutes} 分钟，券 ${burstCouponCount} 张，触发 ${burstTriggeredAt}）`
+        : "无";
+      const mcpHealth = getMcpHealth();
+      const mcpStatus = formatMcpHealthStatus(mcpHealth.status);
+      const mcpLastCheck = formatTimestamp(mcpHealth.lastCheckedAt, AUTO_CLAIM_TIMEZONE);
+      const mcpLastOk = formatTimestamp(mcpHealth.lastOkAt, AUTO_CLAIM_TIMEZONE);
+      const mcpFailures = Number(mcpHealth.consecutiveFailures) || 0;
+      const mcpLastStatusCode = mcpHealth.lastStatusCode || "无";
+      const mcpLastError = mcpHealth.lastError || "无";
+      const errorPushStatus = isAdminErrorPushEnabled() ? "开" : "关";
+      const rerunWindow = AUTO_CLAIM_SPREAD_RERUN_MINUTES
+        ? `已执行账号 ${AUTO_CLAIM_SPREAD_RERUN_MINUTES} 分钟后允许重跑`
+        : "不重复执行";
+      ctx.reply(
+        [
+          "管理员概览：",
+          `用户数：${formatCountWithDelta(metrics.userCount, baseline.userCount)}`,
+          `账号数：${formatCountWithDelta(metrics.accountCount, baseline.accountCount)}`,
+          `自动领券开启账号数：${formatCountWithDelta(metrics.autoClaimEnabledCount, baseline.autoClaimEnabledCount)}`,
+          `自动领券关闭账号数：${formatCountWithDelta(metrics.autoClaimDisabledCount, baseline.autoClaimDisabledCount)}`,
+          `今日已执行账号数：${formatCountWithDelta(metrics.doneCount, baseline.doneCount)}`,
+          `今日待执行账号数：${formatCountWithDelta(metrics.pendingCount, baseline.pendingCount)}`,
+          `今日自动领券成功数：${formatCountWithDelta(metrics.todayAutoClaimSuccess, baseline.todayAutoClaimSuccess)}`,
+          `今日自动领券失败数：${formatCountWithDelta(totalFailure, baselineFailure)}（鉴权${formatCountWithDelta(
+            metrics.todayAutoClaimFailureAuth,
+            baseline.todayAutoClaimFailureAuth
+          )}｜其他${formatCountWithDelta(metrics.todayAutoClaimFailureOther, baseline.todayAutoClaimFailureOther)}）`,
+          `自动领券次数总计：${formatCountWithDelta(metrics.totalAutoClaimRuns, baseline.totalAutoClaimRuns)}`,
+          `手动领券次数总计：${formatCountWithDelta(metrics.totalManualClaimRuns, baseline.totalManualClaimRuns)}`,
+          `累计领取优惠券总计：${formatCountWithDelta(metrics.totalCouponsClaimed, baseline.totalCouponsClaimed)}`,
+          `已记录券 ID 数量：${formatCountWithDelta(metrics.knownCouponsCount, baseline.knownCouponsCount)}`,
+          `最近自动领券请求：${lastRequestAt}`,
+          `最近 Sweep：开始 ${lastSweepStartedAt} ｜结束 ${lastSweepFinishedAt} ｜耗时 ${lastSweepDuration} ｜原因 ${lastSweepReason}`,
+          `Sweep 进度：符合 ${lastSweepEligible} ｜已处理 ${lastSweepProcessed} ｜状态 ${autoClaimSweepInProgress ? "运行中" : "空闲"}`,
+          `Sweep 错误：${lastSweepError}`,
+          `Burst 窗口：${burstStatus}`,
+          `MCP 状态：${mcpStatus}｜最近检查 ${mcpLastCheck}｜最近成功 ${mcpLastOk}｜连续失败 ${mcpFailures}｜状态码 ${mcpLastStatusCode}`,
+          `MCP 最近错误：${mcpLastError}`,
+          `报错推送：${errorPushStatus}`,
+          `调度配置：检查${AUTO_CLAIM_CHECK_MINUTES}分钟｜起始${AUTO_CLAIM_HOUR}点｜分散${AUTO_CLAIM_SPREAD_MINUTES}分钟｜${rerunWindow}｜每轮上限${AUTO_CLAIM_MAX_PER_SWEEP}｜间隔${AUTO_CLAIM_REQUEST_GAP_MS}ms｜Burst${GLOBAL_BURST_WINDOW_MINUTES}分钟/检查${GLOBAL_BURST_CHECK_SECONDS}s｜时区${AUTO_CLAIM_TIMEZONE}`
+        ].join("\n")
+      );
+      return;
+    }
+    case "calendar":
+      await handleCalendar(ctx, payload || null);
+      return;
+    case "coupons":
+      await handleAvailableCoupons(ctx);
+      return;
+    case "claim":
+      await handleClaimCoupons(ctx);
+      return;
+    case "mycoupons":
+      await handleMyCoupons(ctx);
+      return;
+    case "tools":
+      await handleToolsList(ctx);
+      return;
+    case "points":
+      await handlePoints(ctx);
+      return;
+    case "now":
+    case "timeinfo":
+      await handleNowTime(ctx);
+      return;
+    case "nutrition":
+      await handleNutrition(ctx, payload);
+      return;
+    case "mall":
+      await handleMallCommand(ctx, payload);
+      return;
+    case "deliveryaddrs": {
+      const args = parseCommandArgs(ctx);
+      await handleDeliveryAddressesCommand(ctx, args[0] || "");
+      return;
+    }
+    case "deliveryadd":
+      await handleDeliveryAddCommand(ctx, payload);
+      return;
+    case "stores":
+      await handleStoresCommand(ctx, payload);
+      return;
+    case "storecoupons":
+      await handleStoreCouponsCommand(ctx, parseCommandArgs(ctx));
+      return;
+    case "meals":
+      await handleMealsCommand(ctx, parseCommandArgs(ctx));
+      return;
+    case "mealdetail":
+      await handleMealDetailCommand(ctx, parseCommandArgs(ctx));
+      return;
+    case "price":
+      await handlePriceCommand(ctx, payload);
+      return;
+    case "order":
+      await handleOrderCommand(ctx, payload);
+      return;
+    case "tool":
+      await handleRawToolCommand(ctx, payload);
+      return;
+    case "autoclaim": {
+      const args = parseCommandArgs(ctx);
+      const mode = args[0] ? args[0].toLowerCase() : "";
+      if (mode !== "on" && mode !== "off") {
+        ctx.reply("用法：/autoclaim on|off [账号名]");
+        return;
+      }
+      const accountId = args[1] || "";
+      const accountCheck = accountId ? validateAccountIdInput(accountId) : { ok: true, value: "" };
+      if (!accountCheck.ok) {
+        ctx.reply(accountCheck.message);
+        return;
+      }
+      handleAutoClaimSetting(ctx, mode === "on", accountCheck.value || "");
+      return;
+    }
+    case "autoclaimreport": {
+      const args = parseCommandArgs(ctx);
+      const type = args[0] ? args[0].toLowerCase() : "";
+      const enabledRaw = args[1] ? args[1].toLowerCase() : "";
+      if (!["success", "fail", "failure", "all"].includes(type) || !["on", "off"].includes(enabledRaw)) {
+        ctx.reply("用法：/autoclaimreport success|fail on|off [账号名]");
+        return;
+      }
+      const accountId = args[2] || "";
+      const accountCheck = accountId ? validateAccountIdInput(accountId) : { ok: true, value: "" };
+      if (!accountCheck.ok) {
+        ctx.reply(accountCheck.message);
+        return;
+      }
+      const normalizedType = type === "fail" ? "failure" : type;
+      handleAutoClaimReportSetting(
+        ctx,
+        normalizedType === "all" ? "" : normalizedType,
+        enabledRaw === "on",
+        accountCheck.value || ""
+      );
+      return;
+    }
+    default:
+      ctx.reply("暂不支持的合成指令。");
+  }
+}
+
+async function handleSyntheticMessage(userId, text, options = {}) {
+  const ctx = createSyntheticCommandContext(userId, text, options);
+  return dispatchSyntheticCommand(ctx);
+}
+
+function triggerManualSweep(reason = "signal") {
+  logAutoClaim(`Manual sweep trigger received: ${reason}`);
+  runAutoClaimSweep({ forceAll: true }).catch((error) => {
+    console.error("Manual sweep failed", error);
+    notifyAdmins(`手动全员领券触发失败：${sanitizeInlineText(getErrorMessage(error), { maxLength: 400 })}`);
   });
+}
 
-process.once("SIGINT", () => shutdown("SIGINT"));
-process.once("SIGTERM", () => shutdown("SIGTERM"));
+function startRuntime() {
+  startMcpHealthMonitor();
+  startAutoClaimScheduler();
+  startSweepWatchdog();
+
+  bot.launch()
+    .then(() => {
+      console.log("Bot started.");
+      bot.telegram.setMyCommands([
+        { command: "menu", description: "打开按钮菜单" },
+        { command: "token", description: "设置 MCP Token（默认账号）" },
+        { command: "account", description: "账号管理" },
+        { command: "calendar", description: "活动日历查询" },
+        { command: "coupons", description: "可领优惠券列表" },
+        { command: "claim", description: "一键领券" },
+        { command: "mycoupons", description: "我的优惠券" },
+        { command: "autoclaim", description: "每日自动领券开关" },
+        { command: "autoclaimreport", description: "自动领券汇报开关(成/败)" },
+        { command: "status", description: "查看账号状态" },
+        { command: "stats", description: "查看我的领券统计" },
+        { command: "cleartoken", description: "清空全部账号" },
+        { command: "admin", description: "管理员统计" }
+      ]).catch((error) => {
+        console.error("Failed to set bot commands", error);
+      });
+    })
+    .catch((error) => {
+      console.error("Bot failed to start.", error);
+      process.exit(1);
+    });
+
+  process.once("SIGINT", () => shutdown("SIGINT"));
+  process.once("SIGTERM", () => shutdown("SIGTERM"));
+  process.once("SIGUSR2", () => triggerManualSweep("SIGUSR2"));
+}
+
+if (require.main === module) {
+  startRuntime();
+}
+
+module.exports = {
+  bot,
+  createSyntheticMessageUpdate,
+  handleSyntheticMessage,
+  runAutoClaimSweep,
+  shutdown,
+  startRuntime
+};
